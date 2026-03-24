@@ -1,3 +1,4 @@
+from .call_resolver import AlCallResolver
 from .field_extractor import AlFieldExtractor
 from .handler import AlHandler
 from .object_extractor import AlObjectExtractor, ObjectRegistry
@@ -13,6 +14,7 @@ from .utils import (
 )
 
 __all__ = [
+    "AlCallResolver",
     "AlFieldExtractor",
     "AlHandler",
     "AlObjectExtractor",
