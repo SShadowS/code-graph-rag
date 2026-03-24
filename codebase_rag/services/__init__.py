@@ -5,7 +5,12 @@ from ..types_defs import PropertyDict, PropertyValue, ResultRow
 
 @runtime_checkable
 class IngestorProtocol(Protocol):
-    def ensure_node_batch(self, label: str, properties: PropertyDict) -> None: ...
+    def ensure_node_batch(
+        self,
+        label: str,
+        properties: PropertyDict,
+        extra_labels: tuple[str, ...] | None = None,
+    ) -> None: ...
 
     def ensure_relationship_batch(
         self,

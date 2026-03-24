@@ -49,7 +49,13 @@ class ProtobufFileIngestor:
             return str(properties.get(cs.KEY_NAME, ""))
         return str(properties.get(cs.KEY_QUALIFIED_NAME, ""))
 
-    def ensure_node_batch(self, label: str, properties: PropertyDict) -> None:
+    def ensure_node_batch(
+        self,
+        label: str,
+        properties: PropertyDict,
+        extra_labels: tuple[str, ...] | None = None,
+    ) -> None:
+        # (H) extra_labels are not serialized to protobuf — AL-specific labels are lost on export
         node_label = cs.NodeLabel(label)
         node_id = self._get_node_id(node_label, properties)
         if not node_id or node_id in self._nodes:

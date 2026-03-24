@@ -93,7 +93,9 @@ class MemgraphIngestor:
         self._conn_lock = threading.Lock()
         self._executor: ThreadPoolExecutor | None = None
         self.conn: mgclient.Connection | None = None
-        self.node_buffer: list[tuple[str, dict[str, PropertyValue]]] = []
+        self.node_buffer: list[
+            tuple[str, tuple[str, ...] | None, dict[str, PropertyValue]]
+        ] = []
         self._rel_count = 0
         self._rel_groups: defaultdict[
             tuple[str, str, str, str, str], list[RelBatchRow]
@@ -270,9 +272,12 @@ class MemgraphIngestor:
         logger.info(ls.MG_INDEXES_DONE)
 
     def ensure_node_batch(
-        self, label: str, properties: dict[str, PropertyValue]
+        self,
+        label: str,
+        properties: dict[str, PropertyValue],
+        extra_labels: tuple[str, ...] | None = None,
     ) -> None:
-        self.node_buffer.append((label, properties))
+        self.node_buffer.append((label, extra_labels, properties))
         if len(self.node_buffer) >= self.batch_size:
             logger.debug(ls.MG_NODE_BUFFER_FLUSH, size=self.batch_size)
             self.flush_nodes()
@@ -301,6 +306,7 @@ class MemgraphIngestor:
         label: str,
         props_list: list[dict[str, PropertyValue]],
         conn: mgclient.Connection | None = None,
+        extra_labels: tuple[str, ...] | None = None,
     ) -> tuple[int, int]:
         if not props_list:
             return 0, 0
@@ -330,7 +336,7 @@ class MemgraphIngestor:
         build_query = (
             build_merge_node_query if self._use_merge else build_create_node_query
         )
-        query = build_query(label, id_key)
+        query = build_query(label, id_key, extra_labels=extra_labels)
         target_conn = conn or self.conn
         if not target_conn:
             logger.warning(ls.MG_NO_CONN_NODES.format(label=label))
@@ -344,10 +350,13 @@ class MemgraphIngestor:
         self,
         label: str,
         props_list: list[dict[str, PropertyValue]],
+        extra_labels: tuple[str, ...] | None = None,
     ) -> tuple[int, int]:
         conn = self._create_connection()
         try:
-            return self._flush_node_label_group(label, props_list, conn=conn)
+            return self._flush_node_label_group(
+                label, props_list, conn=conn, extra_labels=extra_labels
+            )
         finally:
             conn.close()
 
@@ -367,29 +376,32 @@ class MemgraphIngestor:
             return
 
         buffer_size = len(self.node_buffer)
-        nodes_by_label: defaultdict[str, list[dict[str, PropertyValue]]] = defaultdict(
-            list
-        )
-        for label, props in self.node_buffer:
-            nodes_by_label[label].append(props)
+        nodes_by_key: defaultdict[
+            tuple[str, tuple[str, ...] | None], list[dict[str, PropertyValue]]
+        ] = defaultdict(list)
+        for label, extra_labels, props in self.node_buffer:
+            nodes_by_key[(label, extra_labels)].append(props)
 
         flushed_total = 0
         skipped_total = 0
 
         first_error: Exception | None = None
 
-        if self._executor and len(nodes_by_label) > 1:
+        if self._executor and len(nodes_by_key) > 1:
             logger.info(
                 ls.MG_PARALLEL_FLUSH_NODES.format(
-                    count=len(nodes_by_label),
+                    count=len(nodes_by_key),
                     workers=settings.FLUSH_THREAD_POOL_SIZE,
                 )
             )
             futures = {
                 self._executor.submit(
-                    self._flush_node_group_with_own_conn, label, props_list
+                    self._flush_node_group_with_own_conn,
+                    label,
+                    props_list,
+                    extra_labels,
                 ): label
-                for label, props_list in nodes_by_label.items()
+                for (label, extra_labels), props_list in nodes_by_key.items()
             }
             for future in as_completed(futures):
                 label = futures[future]
@@ -402,9 +414,11 @@ class MemgraphIngestor:
                     if first_error is None:
                         first_error = e
         else:
-            for label, props_list in nodes_by_label.items():
+            for (label, extra_labels), props_list in nodes_by_key.items():
                 try:
-                    flushed, skipped = self._flush_node_label_group(label, props_list)
+                    flushed, skipped = self._flush_node_label_group(
+                        label, props_list, extra_labels=extra_labels
+                    )
                     flushed_total += flushed
                     skipped_total += skipped
                 except Exception as e:

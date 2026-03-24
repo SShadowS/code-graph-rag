@@ -95,7 +95,7 @@ class TestFlushNodesForAllNodeLabels:
         unique_key = NODE_UNIQUE_CONSTRAINTS[label.value]
         node_props = {unique_key: f"test_{label.value}_id", KEY_NAME: "test"}
 
-        ingestor.node_buffer.append((label.value, node_props))
+        ingestor.node_buffer.append((label.value, None, node_props))
         ingestor.flush_nodes()
 
         mock_cursor.execute.assert_called_once()
@@ -112,7 +112,7 @@ class TestFlushNodesForAllNodeLabels:
         unique_key = NODE_UNIQUE_CONSTRAINTS[node_type.value]
         node_props = {unique_key: f"test_{node_type.value}_id", KEY_NAME: "test"}
 
-        ingestor.node_buffer.append((node_type.value, node_props))
+        ingestor.node_buffer.append((node_type.value, None, node_props))
         ingestor.flush_nodes()
 
         mock_cursor.execute.assert_called_once()
@@ -216,7 +216,7 @@ class TestNodeBufferFlushWithMissingKey:
 
         node_props = {KEY_NAME: "test_without_unique_key"}
 
-        ingestor.node_buffer.append((label.value, node_props))
+        ingestor.node_buffer.append((label.value, None, node_props))
         ingestor.flush_nodes()
 
         assert ingestor.node_buffer == []
