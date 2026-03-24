@@ -461,6 +461,19 @@ class GraphUpdater:
 
     def _process_single_file(self, filepath: Path) -> None:
         lang_config = get_language_spec(filepath.suffix)
+
+        if (
+            lang_config
+            and isinstance(lang_config.language, cs.SupportedLanguage)
+            and lang_config.language == cs.SupportedLanguage.AL
+            and lang_config.language in self.parsers
+        ):
+            self.factory.structure_processor.process_generic_file(
+                filepath, filepath.name
+            )
+            self._process_al_file(filepath)
+            return
+
         if (
             lang_config
             and isinstance(lang_config.language, cs.SupportedLanguage)
@@ -479,6 +492,22 @@ class GraphUpdater:
             self.factory.definition_processor.process_dependencies(filepath)
 
         self.factory.structure_processor.process_generic_file(filepath, filepath.name)
+
+    def _process_al_file(self, filepath: Path) -> None:
+        al_parser_obj = self.parsers.get(cs.SupportedLanguage.AL)
+        if not al_parser_obj:
+            return
+
+        with open(filepath, "rb") as f:
+            source = f.read()
+
+        tree = al_parser_obj.parse(source)
+        module_qn = filepath.stem
+
+        from codebase_rag.parsers.al.parser import AlParser
+
+        al_parser = AlParser(self.ingestor, self.repo_path)
+        al_parser.process(tree.root_node, filepath, module_qn)
 
     def _process_function_calls(self) -> None:
         ast_cache_items = list(self.ast_cache.items())
@@ -506,8 +535,7 @@ class GraphUpdater:
             orphans = [
                 r["path"]
                 for r in rows
-                if r.get("path")
-                and not (self.repo_path / r["path"]).exists()
+                if r.get("path") and not (self.repo_path / r["path"]).exists()
             ]
 
             if orphans:

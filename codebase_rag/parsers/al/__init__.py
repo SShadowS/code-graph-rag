@@ -2,6 +2,7 @@ from .call_resolver import AlCallResolver
 from .field_extractor import AlFieldExtractor
 from .handler import AlHandler
 from .object_extractor import AlObjectExtractor, ObjectRegistry
+from .parser import AlParser
 from .procedure_extractor import AlProcedureExtractor
 from .property_reader import AlPropertyReader
 from .relationship_extractor import AlRelationshipExtractor
@@ -18,6 +19,7 @@ __all__ = [
     "AlFieldExtractor",
     "AlHandler",
     "AlObjectExtractor",
+    "AlParser",
     "AlProcedureExtractor",
     "AlPropertyReader",
     "AlRelationshipExtractor",
