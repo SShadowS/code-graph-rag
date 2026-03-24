@@ -3,6 +3,7 @@ from .handler import AlHandler
 from .object_extractor import AlObjectExtractor, ObjectRegistry
 from .procedure_extractor import AlProcedureExtractor
 from .property_reader import AlPropertyReader
+from .relationship_extractor import AlRelationshipExtractor
 from .utils import (
     build_al_qualified_name,
     extract_extends_target,
@@ -17,6 +18,7 @@ __all__ = [
     "AlObjectExtractor",
     "AlProcedureExtractor",
     "AlPropertyReader",
+    "AlRelationshipExtractor",
     "ObjectRegistry",
     "build_al_qualified_name",
     "extract_extends_target",
