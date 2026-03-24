@@ -96,9 +96,7 @@ def test_extends_stub_created():
     rel_extractor = AlRelationshipExtractor(ingestor)
     rel_extractor.extract_relationships(registry, root, "test")
 
-    stub_nodes = [
-        n for n in ingestor.nodes if n[2].get("is_stub") is True
-    ]
+    stub_nodes = [n for n in ingestor.nodes if n[2].get("is_stub") is True]
     assert len(stub_nodes) == 1
     stub = stub_nodes[0]
     assert stub[0] == cs.NodeLabel.CLASS
@@ -114,9 +112,7 @@ def test_extends_stub_has_correct_type():
     rel_extractor = AlRelationshipExtractor(ingestor)
     rel_extractor.extract_relationships(registry, root, "test")
 
-    stub_nodes = [
-        n for n in ingestor.nodes if n[2].get("is_stub") is True
-    ]
+    stub_nodes = [n for n in ingestor.nodes if n[2].get("is_stub") is True]
     assert len(stub_nodes) == 1
     stub = stub_nodes[0]
     assert cs.NodeLabel.TABLE in stub[1]
@@ -170,8 +166,6 @@ def test_using_creates_imports():
     )
 
     # Check that ExternalPackage node was created
-    ext_pkg_nodes = [
-        n for n in ingestor.nodes if n[0] == cs.NodeLabel.EXTERNAL_PACKAGE
-    ]
+    ext_pkg_nodes = [n for n in ingestor.nodes if n[0] == cs.NodeLabel.EXTERNAL_PACKAGE]
     assert len(ext_pkg_nodes) == 1
     assert ext_pkg_nodes[0][2][cs.KEY_NAME] == "Microsoft.Sales.Customer"

@@ -95,9 +95,7 @@ class AlRelationshipExtractor:
                 )
                 logger.info(f"AL IMPLEMENTS: {qn} -> {iface_qn}")
 
-    def _extract_using_imports(
-        self, root_node: ASTNode, module_qn: str
-    ) -> None:
+    def _extract_using_imports(self, root_node: ASTNode, module_qn: str) -> None:
         for child in root_node.children:
             if child.type != "using_statement":
                 continue
@@ -124,9 +122,7 @@ class AlRelationshipExtractor:
             logger.info(f"AL IMPORTS: {module_qn} -> {ns_name}")
 
     @staticmethod
-    def _find_object_by_name(
-        registry: ObjectRegistry, name: str
-    ) -> str | None:
+    def _find_object_by_name(registry: ObjectRegistry, name: str) -> str | None:
         for qn, (_node, _type_label, obj_name, _obj_id) in registry.entries.items():
             if obj_name == name:
                 return qn
