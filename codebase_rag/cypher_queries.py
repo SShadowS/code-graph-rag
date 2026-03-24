@@ -120,8 +120,14 @@ def build_index_query(label: str, prop: str) -> str:
     return f"CREATE INDEX ON :{label}({prop});"
 
 
-def build_merge_node_query(label: str, id_key: str) -> str:
-    return f"MERGE (n:{label} {{{id_key}: row.id}})\nSET n += row.props"
+def build_merge_node_query(
+    label: str, id_key: str, extra_labels: tuple[str, ...] | None = None
+) -> str:
+    query = f"MERGE (n:{label} {{{id_key}: row.id}})\n"
+    for extra in extra_labels or ():
+        query += f"SET n:{extra}\n"
+    query += "SET n += row.props"
+    return query
 
 
 def build_merge_relationship_query(
@@ -141,8 +147,14 @@ def build_merge_relationship_query(
     return query
 
 
-def build_create_node_query(label: str, id_key: str) -> str:
-    return f"CREATE (n:{label} {{{id_key}: row.id}})\nSET n += row.props"
+def build_create_node_query(
+    label: str, id_key: str, extra_labels: tuple[str, ...] | None = None
+) -> str:
+    query = f"CREATE (n:{label} {{{id_key}: row.id}})\n"
+    for extra in extra_labels or ():
+        query += f"SET n:{extra}\n"
+    query += "SET n += row.props"
+    return query
 
 
 def build_create_relationship_query(
