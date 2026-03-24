@@ -217,6 +217,29 @@ PHP_FQN_SPEC = FQNSpec(
     file_to_module_parts=_generic_file_to_module,
 )
 
+
+def _al_get_name(node: Node) -> str | None:
+    for child in node.children:
+        if child.type in ("identifier", "quoted_identifier"):
+            text = child.text.decode() if child.text else None
+            if text and text.startswith('"') and text.endswith('"'):
+                return text[1:-1]
+            return text
+    return None
+
+
+def _al_file_to_module(file_path: Path, repo_root: Path) -> list[str]:
+    relative = file_path.relative_to(repo_root)
+    return [relative.stem]
+
+
+AL_FQN_SPEC = FQNSpec(
+    scope_node_types=frozenset(cs.FQN_AL_SCOPE_TYPES),
+    function_node_types=frozenset(cs.FQN_AL_FUNCTION_TYPES),
+    get_name=_al_get_name,
+    file_to_module_parts=_al_file_to_module,
+)
+
 LANGUAGE_FQN_SPECS: dict[cs.SupportedLanguage, FQNSpec] = {
     cs.SupportedLanguage.PYTHON: PYTHON_FQN_SPEC,
     cs.SupportedLanguage.JS: JS_FQN_SPEC,
@@ -230,6 +253,7 @@ LANGUAGE_FQN_SPECS: dict[cs.SupportedLanguage, FQNSpec] = {
     cs.SupportedLanguage.SCALA: SCALA_FQN_SPEC,
     cs.SupportedLanguage.CSHARP: CSHARP_FQN_SPEC,
     cs.SupportedLanguage.PHP: PHP_FQN_SPEC,
+    cs.SupportedLanguage.AL: AL_FQN_SPEC,
 }
 
 
@@ -458,6 +482,16 @@ LANGUAGE_SPECS: dict[cs.SupportedLanguage, LanguageSpec] = {
         module_node_types=cs.SPEC_LUA_MODULE_TYPES,
         call_node_types=cs.SPEC_LUA_CALL_TYPES,
         import_node_types=cs.SPEC_LUA_IMPORT_TYPES,
+    ),
+    cs.SupportedLanguage.AL: LanguageSpec(
+        language=cs.SupportedLanguage.AL,
+        file_extensions=cs.AL_EXTENSIONS,
+        function_node_types=cs.SPEC_AL_FUNCTION_TYPES,
+        class_node_types=cs.SPEC_AL_CLASS_TYPES,
+        module_node_types=cs.SPEC_AL_MODULE_TYPES,
+        call_node_types=cs.SPEC_AL_CALL_TYPES,
+        import_node_types=cs.SPEC_AL_IMPORT_TYPES,
+        name_field=cs.FIELD_NAME,
     ),
 }
 

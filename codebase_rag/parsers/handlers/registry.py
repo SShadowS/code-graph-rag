@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 
 from ...constants import SupportedLanguage
+from ..al import AlHandler
 from .base import BaseLanguageHandler
 from .cpp import CppHandler
 from .java import JavaHandler
@@ -20,6 +21,7 @@ _HANDLERS: dict[SupportedLanguage, type[BaseLanguageHandler]] = {
     SupportedLanguage.RUST: RustHandler,
     SupportedLanguage.JAVA: JavaHandler,
     SupportedLanguage.LUA: LuaHandler,
+    SupportedLanguage.AL: AlHandler,
 }
 
 _DEFAULT_HANDLER = BaseLanguageHandler
