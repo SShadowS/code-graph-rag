@@ -482,6 +482,94 @@ NODE_SCHEMAS: tuple[NodeSchema, ...] = (
         "{qualified_name: string, name: string, path: string, absolute_path: string, implements_module: string}",
     ),
     NodeSchema(NodeLabel.EXTERNAL_PACKAGE, "{name: string, version_spec: string}"),
+    NodeSchema(
+        NodeLabel.TABLE,
+        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.TABLE_EXTENSION,
+        "{qualified_name: string, name: string, object_id: integer, extends_target: string, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.PAGE,
+        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.PAGE_EXTENSION,
+        "{qualified_name: string, name: string, object_id: integer, extends_target: string, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.CODEUNIT,
+        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.REPORT,
+        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.REPORT_EXTENSION,
+        "{qualified_name: string, name: string, object_id: integer, extends_target: string, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.ENUM_EXTENSION,
+        "{qualified_name: string, name: string, object_id: integer, extends_target: string, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.AL_QUERY,
+        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.XMLPORT,
+        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.CONTROL_ADDIN,
+        "{qualified_name: string, name: string, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.PERMISSION_SET,
+        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.ENTITLEMENT,
+        "{qualified_name: string, name: string, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.PROFILE,
+        "{qualified_name: string, name: string, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.PROCEDURE,
+        "{qualified_name: string, name: string, access_modifier: string, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.TRIGGER,
+        "{qualified_name: string, name: string, trigger_type: string, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.EVENT_SUBSCRIBER,
+        "{qualified_name: string, name: string, path: string, absolute_path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.FIELD,
+        "{qualified_name: string, name: string, field_id: integer, field_type: string}",
+    ),
+    NodeSchema(
+        NodeLabel.KEY,
+        "{qualified_name: string, name: string, fields: list[string]}",
+    ),
+    NodeSchema(
+        NodeLabel.ACTION,
+        "{qualified_name: string, name: string}",
+    ),
+    NodeSchema(
+        NodeLabel.DATA_ITEM,
+        "{qualified_name: string, name: string, source_table: string}",
+    ),
+    NodeSchema(
+        NodeLabel.EXTERNAL_OBJECT,
+        "{qualified_name: string, name: string, is_stub: boolean}",
+    ),
 )
 
 
@@ -565,5 +653,55 @@ RELATIONSHIP_SCHEMAS: tuple[RelationshipSchema, ...] = (
         (NodeLabel.FUNCTION, NodeLabel.METHOD),
         RelationshipType.CALLS,
         (NodeLabel.FUNCTION, NodeLabel.METHOD),
+    ),
+    RelationshipSchema(
+        (NodeLabel.CLASS,),
+        RelationshipType.EXTENDS,
+        (NodeLabel.CLASS,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.FUNCTION,),
+        RelationshipType.SUBSCRIBES_TO,
+        (NodeLabel.FUNCTION,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.CLASS,),
+        RelationshipType.BINDS_TABLE,
+        (NodeLabel.CLASS,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.CLASS,),
+        RelationshipType.HAS_FIELD,
+        (NodeLabel.FIELD,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.CLASS,),
+        RelationshipType.HAS_KEY,
+        (NodeLabel.KEY,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.CLASS,),
+        RelationshipType.HAS_TRIGGER,
+        (NodeLabel.FUNCTION,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.CLASS,),
+        RelationshipType.HAS_ACTION,
+        (NodeLabel.ACTION,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.CLASS,),
+        RelationshipType.HAS_DATAITEM,
+        (NodeLabel.DATA_ITEM,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.DATA_ITEM,),
+        RelationshipType.READS_TABLE,
+        (NodeLabel.CLASS,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.CLASS,),
+        RelationshipType.DISPLAYS_FIELD,
+        (NodeLabel.FIELD,),
     ),
 )

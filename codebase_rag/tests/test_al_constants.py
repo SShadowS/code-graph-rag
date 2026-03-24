@@ -1,4 +1,17 @@
 from codebase_rag import constants as cs
+from codebase_rag.types_defs import NODE_SCHEMAS, RELATIONSHIP_SCHEMAS
+
+
+def test_al_node_schemas_registered():
+    schema_labels = {s.label for s in NODE_SCHEMAS}
+    for label in [cs.NodeLabel.TABLE, cs.NodeLabel.CODEUNIT, cs.NodeLabel.FIELD]:
+        assert label in schema_labels, f"{label} not in NODE_SCHEMAS"
+
+
+def test_al_relationship_schemas_registered():
+    schema_types = {s.rel_type for s in RELATIONSHIP_SCHEMAS}
+    for rel in [cs.RelationshipType.HAS_FIELD, cs.RelationshipType.EXTENDS]:
+        assert rel in schema_types, f"{rel} not in RELATIONSHIP_SCHEMAS"
 
 
 def test_al_in_supported_language():
