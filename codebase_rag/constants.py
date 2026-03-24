@@ -118,6 +118,8 @@ CPP_EXTENSIONS = (
 CS_EXTENSIONS = (EXT_CS,)
 PHP_EXTENSIONS = (EXT_PHP,)
 LUA_EXTENSIONS = (EXT_LUA,)
+EXT_AL = ".al"
+AL_EXTENSIONS = (EXT_AL,)
 
 # (H) Package indicator files
 PKG_INIT_PY = "__init__.py"
@@ -355,6 +357,28 @@ class NodeLabel(StrEnum):
     MODULE_INTERFACE = "ModuleInterface"
     MODULE_IMPLEMENTATION = "ModuleImplementation"
     EXTERNAL_PACKAGE = "ExternalPackage"
+    TABLE = "Table"
+    TABLE_EXTENSION = "TableExtension"
+    PAGE = "Page"
+    PAGE_EXTENSION = "PageExtension"
+    CODEUNIT = "Codeunit"
+    REPORT = "Report"
+    REPORT_EXTENSION = "ReportExtension"
+    ENUM_EXTENSION = "EnumExtension"
+    AL_QUERY = "ALQuery"
+    XMLPORT = "Xmlport"
+    CONTROL_ADDIN = "ControlAddin"
+    PERMISSION_SET = "PermissionSet"
+    ENTITLEMENT = "Entitlement"
+    PROFILE = "Profile"
+    PROCEDURE = "Procedure"
+    TRIGGER = "Trigger"
+    EVENT_SUBSCRIBER = "EventSubscriber"
+    FIELD = "Field"
+    KEY = "Key"
+    ACTION = "Action"
+    DATA_ITEM = "DataItem"
+    EXTERNAL_OBJECT = "ExternalObject"
 
 
 _NODE_LABEL_UNIQUE_KEYS: dict[NodeLabel, UniqueKeyType] = {
@@ -373,6 +397,28 @@ _NODE_LABEL_UNIQUE_KEYS: dict[NodeLabel, UniqueKeyType] = {
     NodeLabel.MODULE_INTERFACE: UniqueKeyType.QUALIFIED_NAME,
     NodeLabel.MODULE_IMPLEMENTATION: UniqueKeyType.QUALIFIED_NAME,
     NodeLabel.EXTERNAL_PACKAGE: UniqueKeyType.NAME,
+    NodeLabel.TABLE: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.TABLE_EXTENSION: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.PAGE: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.PAGE_EXTENSION: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.CODEUNIT: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.REPORT: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.REPORT_EXTENSION: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.ENUM_EXTENSION: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.AL_QUERY: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.XMLPORT: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.CONTROL_ADDIN: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.PERMISSION_SET: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.ENTITLEMENT: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.PROFILE: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.PROCEDURE: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.TRIGGER: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.EVENT_SUBSCRIBER: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.FIELD: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.KEY: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.ACTION: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.DATA_ITEM: UniqueKeyType.QUALIFIED_NAME,
+    NodeLabel.EXTERNAL_OBJECT: UniqueKeyType.QUALIFIED_NAME,
 }
 
 _missing_keys = set(NodeLabel) - set(_NODE_LABEL_UNIQUE_KEYS.keys())
@@ -399,6 +445,16 @@ class RelationshipType(StrEnum):
     OVERRIDES = "OVERRIDES"
     CALLS = "CALLS"
     DEPENDS_ON_EXTERNAL = "DEPENDS_ON_EXTERNAL"
+    EXTENDS = "EXTENDS"
+    SUBSCRIBES_TO = "SUBSCRIBES_TO"
+    BINDS_TABLE = "BINDS_TABLE"
+    HAS_FIELD = "HAS_FIELD"
+    HAS_KEY = "HAS_KEY"
+    HAS_TRIGGER = "HAS_TRIGGER"
+    HAS_ACTION = "HAS_ACTION"
+    HAS_DATAITEM = "HAS_DATAITEM"
+    READS_TABLE = "READS_TABLE"
+    DISPLAYS_FIELD = "DISPLAYS_FIELD"
 
 
 NODE_PROJECT = NodeLabel.PROJECT
@@ -468,6 +524,7 @@ class SupportedLanguage(StrEnum):
     CSHARP = "c-sharp"
     PHP = "php"
     LUA = "lua"
+    AL = "al"
 
 
 class LanguageStatus(StrEnum):
@@ -541,6 +598,11 @@ LANGUAGE_METADATA: dict[SupportedLanguage, LanguageMetadata] = {
         LanguageStatus.DEV,
         "Classes, functions, namespaces",
         "PHP",
+    ),
+    SupportedLanguage.AL: LanguageMetadata(
+        status=LanguageStatus.DEV,
+        additional_features="Tables, pages, codeunits, extensions, triggers, event subscriptions",
+        display_name="AL",
     ),
 }
 
@@ -770,6 +832,7 @@ class TreeSitterModule(StrEnum):
     C = "tree_sitter_c"
     CPP = "tree_sitter_cpp"
     LUA = "tree_sitter_lua"
+    AL = "tree_sitter_al"
 
 
 # (H) Query dict keys
@@ -1775,6 +1838,51 @@ TS_PHP_MEMBER_CALL_EXPRESSION = "member_call_expression"
 TS_PHP_SCOPED_CALL_EXPRESSION = "scoped_call_expression"
 TS_PHP_FUNCTION_CALL_EXPRESSION = "function_call_expression"
 TS_PHP_NULLSAFE_MEMBER_CALL_EXPRESSION = "nullsafe_member_call_expression"
+
+# (H) Tree-sitter AL node types for language_spec
+TS_AL_CODEUNIT_DECLARATION = "codeunit_declaration"
+TS_AL_TABLE_DECLARATION = "table_declaration"
+TS_AL_TABLE_EXTENSION_DECLARATION = "tableextension_declaration"
+TS_AL_PAGE_DECLARATION = "page_declaration"
+TS_AL_PAGE_EXTENSION_DECLARATION = "pageextension_declaration"
+TS_AL_PAGE_CUSTOMIZATION_DECLARATION = "pagecustomization_declaration"
+TS_AL_REPORT_DECLARATION = "report_declaration"
+TS_AL_REPORT_EXTENSION_DECLARATION = "reportextension_declaration"
+TS_AL_QUERY_DECLARATION = "query_declaration"
+TS_AL_XMLPORT_DECLARATION = "xmlport_declaration"
+TS_AL_ENUM_DECLARATION = "enum_declaration"
+TS_AL_ENUM_EXTENSION_DECLARATION = "enumextension_declaration"
+TS_AL_INTERFACE_DECLARATION = "interface_declaration"
+TS_AL_CONTROL_ADDIN_DECLARATION = "controladdin_declaration"
+TS_AL_PERMISSION_SET_DECLARATION = "permissionset_declaration"
+TS_AL_PERMISSION_SET_EXTENSION_DECLARATION = "permissionsetextension_declaration"
+TS_AL_ENTITLEMENT_DECLARATION = "entitlement_declaration"
+TS_AL_PROFILE_DECLARATION = "profile_declaration"
+TS_AL_PROFILE_EXTENSION_DECLARATION = "profileextension_declaration"
+TS_AL_DOTNET_DECLARATION = "dotnet_declaration"
+TS_AL_PROCEDURE = "procedure"
+TS_AL_TRIGGER_DECLARATION = "trigger_declaration"
+TS_AL_EVENT_DECLARATION = "event_declaration"
+TS_AL_INTERFACE_PROCEDURE = "interface_procedure"
+TS_AL_FIELD_DECLARATION = "field_declaration"
+TS_AL_KEY_DECLARATION = "key_declaration"
+TS_AL_FIELDGROUP_DECLARATION = "fieldgroup_declaration"
+TS_AL_ACTION_DECLARATION = "action_declaration"
+TS_AL_REPORT_DATAITEM = "report_dataitem"
+TS_AL_QUERY_DATAITEM = "query_dataitem"
+TS_AL_CALL_EXPRESSION = "call_expression"
+TS_AL_MEMBER_EXPRESSION = "member_expression"
+TS_AL_ATTRIBUTE_ITEM = "attribute_item"
+TS_AL_VAR_SECTION = "var_section"
+TS_AL_VARIABLE_DECLARATION = "variable_declaration"
+TS_AL_FIELDS_SECTION = "fields_section"
+TS_AL_KEYS_SECTION = "keys_section"
+TS_AL_LAYOUT_SECTION = "layout_section"
+TS_AL_ACTIONS_SECTION = "actions_section"
+TS_AL_DATASET_SECTION = "dataset_section"
+TS_AL_PROPERTY = "property"
+TS_AL_NAMESPACE_DECLARATION = "namespace_declaration"
+TS_AL_USING_STATEMENT = "using_statement"
 
 # (H) Tree-sitter Lua node types for language_spec
 TS_LUA_CHUNK = "chunk"
@@ -2864,6 +2972,56 @@ SPEC_LUA_CLASS_TYPES: tuple[str, ...] = ()
 SPEC_LUA_MODULE_TYPES = (TS_LUA_CHUNK,)
 SPEC_LUA_CALL_TYPES = (TS_LUA_FUNCTION_CALL,)
 SPEC_LUA_IMPORT_TYPES = (TS_LUA_FUNCTION_CALL,)
+
+# (H) FQN node type tuples for AL
+FQN_AL_SCOPE_TYPES = (
+    TS_AL_CODEUNIT_DECLARATION,
+    TS_AL_TABLE_DECLARATION,
+    TS_AL_TABLE_EXTENSION_DECLARATION,
+    TS_AL_PAGE_DECLARATION,
+    TS_AL_PAGE_EXTENSION_DECLARATION,
+    TS_AL_REPORT_DECLARATION,
+    TS_AL_REPORT_EXTENSION_DECLARATION,
+    TS_AL_QUERY_DECLARATION,
+    TS_AL_XMLPORT_DECLARATION,
+    TS_AL_ENUM_DECLARATION,
+    TS_AL_ENUM_EXTENSION_DECLARATION,
+    TS_AL_INTERFACE_DECLARATION,
+    TS_AL_CONTROL_ADDIN_DECLARATION,
+    TS_AL_PERMISSION_SET_DECLARATION,
+    TS_AL_ENTITLEMENT_DECLARATION,
+    TS_AL_PROFILE_DECLARATION,
+)
+FQN_AL_FUNCTION_TYPES = (TS_AL_PROCEDURE, TS_AL_TRIGGER_DECLARATION)
+
+# (H) LANGUAGE_SPECS node type tuples for AL
+SPEC_AL_FUNCTION_TYPES = (
+    TS_AL_PROCEDURE,
+    TS_AL_TRIGGER_DECLARATION,
+    TS_AL_EVENT_DECLARATION,
+    TS_AL_INTERFACE_PROCEDURE,
+)
+SPEC_AL_CLASS_TYPES = (
+    TS_AL_CODEUNIT_DECLARATION,
+    TS_AL_TABLE_DECLARATION,
+    TS_AL_TABLE_EXTENSION_DECLARATION,
+    TS_AL_PAGE_DECLARATION,
+    TS_AL_PAGE_EXTENSION_DECLARATION,
+    TS_AL_REPORT_DECLARATION,
+    TS_AL_REPORT_EXTENSION_DECLARATION,
+    TS_AL_QUERY_DECLARATION,
+    TS_AL_XMLPORT_DECLARATION,
+    TS_AL_ENUM_DECLARATION,
+    TS_AL_ENUM_EXTENSION_DECLARATION,
+    TS_AL_INTERFACE_DECLARATION,
+    TS_AL_CONTROL_ADDIN_DECLARATION,
+    TS_AL_PERMISSION_SET_DECLARATION,
+    TS_AL_ENTITLEMENT_DECLARATION,
+    TS_AL_PROFILE_DECLARATION,
+)
+SPEC_AL_MODULE_TYPES = (TS_AL_NAMESPACE_DECLARATION,)
+SPEC_AL_CALL_TYPES = (TS_AL_CALL_EXPRESSION, TS_AL_MEMBER_EXPRESSION)
+SPEC_AL_IMPORT_TYPES = (TS_AL_USING_STATEMENT,)
 
 HEALTH_CHECK_DOCKER_RUNNING = "Docker daemon is running"
 HEALTH_CHECK_DOCKER_NOT_RUNNING = "Docker daemon is not running"
