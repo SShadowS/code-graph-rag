@@ -91,14 +91,14 @@ def init_session_log(project_root: Path) -> Path:
     app_context.session.log_file = (
         log_dir / f"{cs.SESSION_LOG_PREFIX}{uuid.uuid4().hex[:8]}{cs.SESSION_LOG_EXT}"
     )
-    with open(app_context.session.log_file, "w") as f:
+    with open(app_context.session.log_file, "w", encoding=cs.ENCODING_UTF8) as f:
         f.write(cs.SESSION_LOG_HEADER)
     return app_context.session.log_file
 
 
 def log_session_event(event: str) -> None:
     if app_context.session.log_file:
-        with open(app_context.session.log_file, "a") as f:
+        with open(app_context.session.log_file, "a", encoding=cs.ENCODING_UTF8) as f:
             f.write(f"{event}\n")
 
 
