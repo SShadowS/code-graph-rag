@@ -6,19 +6,19 @@ from loguru import logger
 
 from ... import constants as cs
 from .object_extractor import ObjectRegistry
-from .utils import collect_descendants, object_body
+from .utils import (
+    collect_descendants,
+    named_field_node,
+    named_field_text,
+    object_body,
+    strip_quotes,
+)
 
 if TYPE_CHECKING:
     from ...services import IngestorProtocol
     from ...types_defs import ASTNode, PropertyDict
 
 FIELD_BEARING_TYPES = frozenset({cs.NodeLabel.TABLE, cs.NodeLabel.TABLE_EXTENSION})
-
-
-def _strip_quotes(text: str) -> str:
-    if text.startswith('"') and text.endswith('"'):
-        return text[1:-1]
-    return text
 
 
 def _node_text(node: ASTNode) -> str:
@@ -30,10 +30,6 @@ def _find_child(node: ASTNode, type_name: str) -> ASTNode | None:
         if child.type == type_name:
             return child
     return None
-
-
-def _find_children(node: ASTNode, type_name: str) -> list[ASTNode]:
-    return [child for child in node.children if child.type == type_name]
 
 
 class AlFieldExtractor:
@@ -60,20 +56,13 @@ class AlFieldExtractor:
             self._process_field(field_decl, parent_qn)
 
     def _process_field(self, field_decl: ASTNode, parent_qn: str) -> None:
-        integer_node = _find_child(field_decl, "integer")
-        quoted_id_node = _find_child(field_decl, "quoted_identifier")
-        type_spec_node = _find_child(field_decl, "type_specification")
-
-        if quoted_id_node is None:
+        field_name = named_field_text(field_decl, cs.FIELD_NAME)
+        if field_name is None:
             return
-
-        field_name = _strip_quotes(_node_text(quoted_id_node))
-        field_id = (
-            int(_node_text(integer_node))
-            if integer_node and _node_text(integer_node).isdigit()
-            else None
-        )
-        field_type = _node_text(type_spec_node) if type_spec_node else ""
+        id_text = named_field_text(field_decl, cs.AL_FIELD_ID)
+        field_id = int(id_text) if id_text and id_text.isdigit() else None
+        type_node = named_field_node(field_decl, cs.FIELD_TYPE)
+        field_type = _node_text(type_node) if type_node else ""
 
         field_qn = f"{parent_qn}{cs.SEPARATOR_DOT}{field_name}"
 
@@ -104,16 +93,17 @@ class AlFieldExtractor:
             self._process_key(key_decl, parent_qn)
 
     def _process_key(self, key_decl: ASTNode, parent_qn: str) -> None:
-        id_node = _find_child(key_decl, "identifier")
-        if id_node is None:
+        key_name = named_field_text(key_decl, cs.FIELD_NAME)
+        if key_name is None:
             return
-
-        key_name = _node_text(id_node)
-        field_list_node = _find_child(key_decl, "field_list")
+        field_list_node = named_field_node(key_decl, cs.AL_FIELD_FIELDS)
         fields: list[str] = []
         if field_list_node is not None:
-            for qi in _find_children(field_list_node, "quoted_identifier"):
-                fields.append(_strip_quotes(_node_text(qi)))
+            fields = [
+                strip_quotes(_node_text(child))
+                for child in field_list_node.named_children
+                if child.type in (cs.TS_AL_IDENTIFIER, cs.TS_AL_QUOTED_IDENTIFIER)
+            ]
 
         key_qn = f"{parent_qn}{cs.SEPARATOR_DOT}{key_name}"
 

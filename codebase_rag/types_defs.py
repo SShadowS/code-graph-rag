@@ -949,11 +949,11 @@ NODE_SCHEMAS: tuple[NodeSchema, ...] = (
     ),
     NodeSchema(
         NodeLabel.PAGE,
-        "{qualified_name: string, name: string, object_id: int, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, object_id: int, path: string, absolute_path: string, displayed_fields: list[string]?}",
     ),
     NodeSchema(
         NodeLabel.PAGE_EXTENSION,
-        "{qualified_name: string, name: string, object_id: int, extends_target: string, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, object_id: int, extends_target: string, path: string, absolute_path: string, displayed_fields: list[string]?}",
     ),
     NodeSchema(
         NodeLabel.CODEUNIT,

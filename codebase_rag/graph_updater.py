@@ -767,6 +767,7 @@ class GraphUpdater:
         # and evicts on large repos, so Pass 3 must iterate this full list (not
         # the cache) and re-parse evicted files, or their calls are dropped.
         self._parsed_files: list[tuple[Path, cs.SupportedLanguage]] = []
+        self._al_files_seen = False
         # Rel-path -> registered qns for FRONTEND registrations, which have
         # no tree-sitter span records; the watch prefix sweep reads this to
         # spare foreign files' entries (issue #1025).
@@ -1690,6 +1691,8 @@ class GraphUpdater:
         self.ingestor.flush_all()
 
         self._link_endpoint_resources()
+
+        self._link_al_displayed_fields()
 
         self._prune_orphan_nodes()
         # The prune issues its own deletes and has no flush of its own, so the
@@ -4066,6 +4069,7 @@ class GraphUpdater:
         al_parser_obj = self.parsers.get(cs.SupportedLanguage.AL)
         if not al_parser_obj:
             return
+        self._al_files_seen = True
         source = file_bytes if file_bytes is not None else filepath.read_bytes()
         tree = al_parser_obj.parse(source)
 
@@ -4074,6 +4078,11 @@ class GraphUpdater:
         AlParser(self.ingestor, self.repo_path).process(
             tree.root_node, filepath, filepath.stem
         )
+
+    def _link_al_displayed_fields(self) -> None:
+        if not self._al_files_seen or not isinstance(self.ingestor, QueryProtocol):
+            return
+        self.ingestor.execute_write(cs.CYPHER_LINK_AL_DISPLAYED_FIELDS)
 
     def process_with_secondary_tier(self, filepath: Path) -> bool:
         """Parse a file with whichever non-tree-sitter tier claims it.
@@ -4463,6 +4472,7 @@ class GraphUpdater:
         if isinstance(self.ingestor, QueryProtocol):
             self.ingestor.execute_write(cs.CYPHER_DELETE_ORPHAN_EXTERNAL_MODULES)
         self.ingestor.flush_all()
+        self._link_al_displayed_fields()
 
     def _reingest_update_hashes(
         self,

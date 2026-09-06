@@ -6,7 +6,12 @@ from loguru import logger
 
 from ... import constants as cs
 from .object_extractor import ObjectRegistry
-from .utils import collect_descendants, object_body
+from .utils import (
+    collect_descendants,
+    named_field_node,
+    named_field_text,
+    object_body,
+)
 
 if TYPE_CHECKING:
     from ...services import IngestorProtocol
@@ -36,10 +41,6 @@ def _find_child(node: ASTNode, type_name: str) -> ASTNode | None:
     return None
 
 
-def _find_children(node: ASTNode, type_name: str) -> list[ASTNode]:
-    return [child for child in node.children if child.type == type_name]
-
-
 def _extract_source_table(node: ASTNode) -> str | None:
     for child in object_body(node).children:
         if child.type != cs.TS_AL_PROPERTY:
@@ -58,6 +59,22 @@ def _extract_source_table(node: ASTNode) -> str | None:
     return None
 
 
+def _displayed_source_fields(layout_section: ASTNode) -> list[str]:
+    displayed: list[str] = []
+    for page_field in collect_descendants(layout_section, cs.TS_AL_PAGE_FIELD):
+        source = named_field_node(page_field, cs.AL_FIELD_SOURCE)
+        if source is None:
+            continue
+        if source.type in (cs.TS_AL_IDENTIFIER, cs.TS_AL_QUOTED_IDENTIFIER):
+            displayed.append(_strip_quotes(_node_text(source)))
+        elif source.type == cs.TS_AL_MEMBER_EXPRESSION:
+            owner = named_field_text(source, cs.FIELD_OBJECT)
+            member = named_field_text(source, cs.AL_FIELD_MEMBER)
+            if owner and member and owner.lower() == cs.AL_PAGE_RECORD_VARIABLE:
+                displayed.append(member)
+    return displayed
+
+
 class AlPropertyReader:
     __slots__ = ("ingestor",)
 
@@ -72,11 +89,13 @@ class AlPropertyReader:
             _object_id,
         ) in registry.entries.items():
             if object_type_label in PAGE_TYPES:
-                self._process_page(node, parent_qn)
+                self._process_page(node, parent_qn, object_type_label)
             if object_type_label in DATAITEM_BEARING_TYPES:
                 self._process_dataitems(node, parent_qn)
 
-    def _process_page(self, node: ASTNode, parent_qn: str) -> None:
+    def _process_page(
+        self, node: ASTNode, parent_qn: str, object_type_label: str
+    ) -> None:
         source_table = _extract_source_table(node)
         if source_table:
             self.ingestor.ensure_relationship_batch(
@@ -88,12 +107,17 @@ class AlPropertyReader:
 
         layout_section = _find_child(object_body(node), cs.TS_AL_LAYOUT_SECTION)
         if layout_section:
-            page_fields = collect_descendants(layout_section, "page_field")
-            for pf in page_fields:
-                qi = _find_child(pf, "quoted_identifier")
-                if qi is not None:
-                    field_name = _strip_quotes(_node_text(qi))
-                    logger.debug(f"AL page field: {parent_qn} displays {field_name}")
+            displayed = _displayed_source_fields(layout_section)
+            if displayed:
+                self.ingestor.ensure_node_batch(
+                    cs.NodeLabel.CLASS,
+                    {
+                        cs.KEY_QUALIFIED_NAME: parent_qn,
+                        cs.KEY_DISPLAYED_FIELDS: displayed,
+                    },
+                    extra_labels=(object_type_label,),
+                )
+                logger.debug(f"AL page fields: {parent_qn} displays {displayed}")
 
         actions_section = _find_child(object_body(node), cs.TS_AL_ACTIONS_SECTION)
         if actions_section:
@@ -129,23 +153,23 @@ class AlPropertyReader:
         logger.debug(f"AL action: {action_qn}")
 
     def _process_dataitems(self, node: ASTNode, parent_qn: str) -> None:
-        dataset_section = _find_child(object_body(node), cs.TS_AL_DATASET_SECTION)
-        if dataset_section is None:
-            return
-
+        body = object_body(node)
+        sections = [
+            section
+            for section_type in (cs.TS_AL_DATASET_SECTION, cs.TS_AL_ELEMENTS_SECTION)
+            if (section := _find_child(body, section_type)) is not None
+        ]
         dataitem_types = (cs.TS_AL_REPORT_DATAITEM, cs.TS_AL_QUERY_DATAITEM)
-        for dt in dataitem_types:
-            for di_node in collect_descendants(dataset_section, dt):
-                self._process_dataitem(di_node, parent_qn)
+        for section in sections:
+            for dt in dataitem_types:
+                for di_node in collect_descendants(section, dt):
+                    self._process_dataitem(di_node, parent_qn)
 
     def _process_dataitem(self, di_node: ASTNode, parent_qn: str) -> None:
-        ident = _find_child(di_node, "identifier")
-        if ident is None:
+        dataitem_name = named_field_text(di_node, cs.FIELD_NAME)
+        if dataitem_name is None:
             return
-        dataitem_name = _node_text(ident)
-
-        qi = _find_child(di_node, "quoted_identifier")
-        source_table = _strip_quotes(_node_text(qi)) if qi is not None else ""
+        source_table = named_field_text(di_node, cs.AL_FIELD_TABLE_NAME) or ""
 
         dataitem_qn = f"{parent_qn}{cs.SEPARATOR_DOT}{dataitem_name}"
 

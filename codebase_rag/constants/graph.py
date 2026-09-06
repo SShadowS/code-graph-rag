@@ -587,6 +587,13 @@ CYPHER_DELETE_PACKAGE = "MATCH (p:Package {absolute_path: $path}) DETACH DELETE 
 # OPTIONAL MATCH + count instead of `WHERE NOT (m)<--()`: Memgraph 3.x
 # rejects pattern expressions inside WHERE, and this form is accepted by
 # both 2.x and 3.x (issue #1257).
+CYPHER_LINK_AL_DISPLAYED_FIELDS = (
+    "MATCH (p:Class)-[:EXTENDS*0..1]->(:Page)-[:BINDS_TABLE]->(:Table)"
+    "-[:HAS_FIELD]->(f:Field) "
+    "WHERE f.name IN p.displayed_fields "
+    "MERGE (p)-[:DISPLAYS_FIELD]->(f)"
+)
+
 CYPHER_DELETE_ORPHAN_EXTERNAL_MODULES = (
     "MATCH (m:ExternalModule) "
     "OPTIONAL MATCH (x)-->(m) "

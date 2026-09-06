@@ -416,6 +416,7 @@ message GraphCodeIndex {
     int32 object_id = 3;
     string path = 4;
     string absolute_path = 5;
+    repeated string displayed_fields = 6;
   }
 
   message PageExtension {
@@ -427,6 +428,7 @@ message GraphCodeIndex {
     string extends_target = 4;
     string path = 5;
     string absolute_path = 6;
+    repeated string displayed_fields = 7;
   }
 
   message Codeunit {

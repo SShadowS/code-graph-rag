@@ -137,3 +137,37 @@ def test_member_call_resolved_through_record_variable():
     assert len(calls_rels) == 1
     assert calls_rels[0][0][2] == "Codeunit.50301.MemberCU.UseIt"
     assert calls_rels[0][2][2] == "Table.50300.Customer.Bar"
+
+
+AL_MEMBER_CALL_UNQUOTED = b"""
+table 50302 Customer
+{
+    fields { field(1; "No."; Code[20]) { } }
+
+    procedure Bar()
+    begin
+    end;
+}
+
+codeunit 50303 "MemberCU2"
+{
+    procedure UseIt()
+    var
+        Cust: Record Customer;
+    begin
+        Cust.Bar();
+    end;
+}
+"""
+
+
+def test_member_call_resolved_through_unquoted_record_type():
+    ingestor, registry, proc_registry = _setup(AL_MEMBER_CALL_UNQUOTED)
+    resolver = AlCallResolver(ingestor)
+    resolver.resolve_calls(registry, proc_registry)
+
+    calls_rels = [
+        r for r in ingestor.relationships if r[1] == cs.RelationshipType.CALLS
+    ]
+    assert len(calls_rels) == 1
+    assert calls_rels[0][2][2] == "Table.50302.Customer.Bar"

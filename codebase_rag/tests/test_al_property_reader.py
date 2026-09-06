@@ -180,3 +180,94 @@ def test_reads_table_relationship():
         "Report.50104.MyReport.Customer",
     )
     assert rel[2] == (cs.NodeLabel.CLASS, cs.KEY_NAME, "Customer")
+
+
+DISPLAY_PAGE_AL = b"""
+page 50105 DisplayPage
+{
+    SourceTable = Customer;
+    layout
+    {
+        area(Content)
+        {
+            repeater(Group)
+            {
+                field("No."; Rec."No.") { }
+                field(Name; Rec.Name) { }
+                field(Addr; Address) { }
+                field(Calc; CalcProc()) { }
+                field(Other; OtherRec.Name) { }
+            }
+        }
+    }
+}
+"""
+
+QUERY_AL = b"""
+query 50106 MyQuery
+{
+    elements
+    {
+        dataitem(Cust; Customer)
+        {
+            column(Name; Name) { }
+            dataitem(Line; "Sales Line") { }
+        }
+    }
+}
+"""
+
+
+def _read(src: bytes, filename: str):
+    root = PARSER.parse(src).root_node
+    ingestor = MockIngestor()
+    registry = AlObjectExtractor(ingestor, Path("/repo")).extract_objects(
+        root, Path(f"/repo/{filename}"), "test"
+    )
+    AlPropertyReader(ingestor).read_properties(registry)
+    return ingestor
+
+
+def test_page_records_displayed_source_fields():
+    ingestor = _read(DISPLAY_PAGE_AL, "display.al")
+    page_batches = [
+        n
+        for n in ingestor.nodes
+        if n[0] == cs.NodeLabel.CLASS
+        and n[2][cs.KEY_QUALIFIED_NAME] == "Page.50105.DisplayPage"
+        and cs.KEY_DISPLAYED_FIELDS in n[2]
+    ]
+    assert len(page_batches) == 1
+    assert page_batches[0][1] == (cs.NodeLabel.PAGE,)
+    assert page_batches[0][2][cs.KEY_DISPLAYED_FIELDS] == ["No.", "Name", "Address"]
+
+
+def test_unquoted_source_table_binds():
+    ingestor = _read(DISPLAY_PAGE_AL, "display.al")
+    binds = [
+        r for r in ingestor.relationships if r[1] == cs.RelationshipType.BINDS_TABLE
+    ]
+    assert [r[2][2] for r in binds] == ["Customer"]
+
+
+def test_query_elements_dataitems_extracted():
+    ingestor = _read(QUERY_AL, "query.al")
+    items = {
+        n[2][cs.KEY_NAME]: n[2]
+        for n in ingestor.nodes
+        if n[0] == cs.NodeLabel.DATA_ITEM
+    }
+    assert set(items) == {"Cust", "Line"}
+    assert items["Cust"]["source_table"] == "Customer"
+    assert items["Line"]["source_table"] == "Sales Line"
+    reads = [
+        r for r in ingestor.relationships if r[1] == cs.RelationshipType.READS_TABLE
+    ]
+    assert {r[2][2] for r in reads} == {"Customer", "Sales Line"}
+    has = [
+        r for r in ingestor.relationships if r[1] == cs.RelationshipType.HAS_DATAITEM
+    ]
+    assert {r[2][2] for r in has} == {
+        "ALQuery.50106.MyQuery.Cust",
+        "ALQuery.50106.MyQuery.Line",
+    }

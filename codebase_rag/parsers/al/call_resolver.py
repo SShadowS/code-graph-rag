@@ -8,7 +8,12 @@ from loguru import logger
 from ... import constants as cs
 from .object_extractor import ObjectRegistry
 from .procedure_extractor import PROCEDURE_NODE_TYPES
-from .utils import collect_descendants, object_body
+from .utils import (
+    collect_descendants,
+    named_field_node,
+    named_field_text,
+    object_body,
+)
 
 if TYPE_CHECKING:
     from ...services import IngestorProtocol
@@ -28,29 +33,26 @@ def _find_call_expressions(node: ASTNode) -> list[ASTNode]:
     return results
 
 
+def _record_table_name(var_decl: ASTNode) -> str | None:
+    type_spec = named_field_node(var_decl, cs.FIELD_TYPE)
+    if type_spec is None:
+        return None
+    for child in type_spec.children:
+        if child.type == cs.TS_AL_RECORD_TYPE:
+            return named_field_text(child, cs.AL_FIELD_REFERENCE)
+    return None
+
+
 def _extract_var_types(proc_node: ASTNode) -> dict[str, str]:
     var_types: dict[str, str] = {}
     for child in proc_node.children:
-        if child.type == cs.TS_AL_VAR_SECTION:
-            for var_decl in collect_descendants(child, cs.TS_AL_VARIABLE_DECLARATION):
-                if var_decl.type == cs.TS_AL_VARIABLE_DECLARATION:
-                    var_name: str | None = None
-                    table_name: str | None = None
-                    for vc in var_decl.children:
-                        if vc.type == "identifier" and var_name is None:
-                            var_name = _node_text(vc) or None
-                        if vc.type == "type_specification":
-                            for ts in vc.children:
-                                if ts.type == "record_type":
-                                    for rt in ts.children:
-                                        if rt.type == "quoted_identifier":
-                                            text = _node_text(rt)
-                                            if text.startswith('"') and text.endswith(
-                                                '"'
-                                            ):
-                                                table_name = text[1:-1]
-                    if var_name and table_name:
-                        var_types[var_name] = table_name
+        if child.type != cs.TS_AL_VAR_SECTION:
+            continue
+        for var_decl in collect_descendants(child, cs.TS_AL_VARIABLE_DECLARATION):
+            var_name = named_field_text(var_decl, cs.FIELD_NAME)
+            table_name = _record_table_name(var_decl)
+            if var_name and table_name:
+                var_types[var_name] = table_name
     return var_types
 
 
@@ -186,16 +188,10 @@ class AlCallResolver:
         var_types: dict[str, str],
         procedure_registry: dict[str, str],
     ) -> None:
-        identifiers: list[str] = []
-        for ch in member_node.children:
-            if ch.type == "identifier":
-                identifiers.append(_node_text(ch))
-
-        if len(identifiers) < 2:
+        obj_name = named_field_text(member_node, cs.FIELD_OBJECT)
+        method_name = named_field_text(member_node, cs.AL_FIELD_MEMBER)
+        if not obj_name or not method_name:
             return
-
-        obj_name = identifiers[0]
-        method_name = identifiers[1]
 
         table_name = var_types.get(obj_name)
         if table_name is None:

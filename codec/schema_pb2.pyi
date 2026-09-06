@@ -433,34 +433,38 @@ class TableExtension(_message.Message):
     def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., object_id: _Optional[int] = ..., extends_target: _Optional[str] = ..., path: _Optional[str] = ..., absolute_path: _Optional[str] = ...) -> None: ...
 
 class Page(_message.Message):
-    __slots__ = ("qualified_name", "name", "object_id", "path", "absolute_path")
+    __slots__ = ("qualified_name", "name", "object_id", "path", "absolute_path", "displayed_fields")
     QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
     NAME_FIELD_NUMBER: _ClassVar[int]
     OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
     PATH_FIELD_NUMBER: _ClassVar[int]
     ABSOLUTE_PATH_FIELD_NUMBER: _ClassVar[int]
+    DISPLAYED_FIELDS_FIELD_NUMBER: _ClassVar[int]
     qualified_name: str
     name: str
     object_id: int
     path: str
     absolute_path: str
-    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., object_id: _Optional[int] = ..., path: _Optional[str] = ..., absolute_path: _Optional[str] = ...) -> None: ...
+    displayed_fields: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., object_id: _Optional[int] = ..., path: _Optional[str] = ..., absolute_path: _Optional[str] = ..., displayed_fields: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class PageExtension(_message.Message):
-    __slots__ = ("qualified_name", "name", "object_id", "extends_target", "path", "absolute_path")
+    __slots__ = ("qualified_name", "name", "object_id", "extends_target", "path", "absolute_path", "displayed_fields")
     QUALIFIED_NAME_FIELD_NUMBER: _ClassVar[int]
     NAME_FIELD_NUMBER: _ClassVar[int]
     OBJECT_ID_FIELD_NUMBER: _ClassVar[int]
     EXTENDS_TARGET_FIELD_NUMBER: _ClassVar[int]
     PATH_FIELD_NUMBER: _ClassVar[int]
     ABSOLUTE_PATH_FIELD_NUMBER: _ClassVar[int]
+    DISPLAYED_FIELDS_FIELD_NUMBER: _ClassVar[int]
     qualified_name: str
     name: str
     object_id: int
     extends_target: str
     path: str
     absolute_path: str
-    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., object_id: _Optional[int] = ..., extends_target: _Optional[str] = ..., path: _Optional[str] = ..., absolute_path: _Optional[str] = ...) -> None: ...
+    displayed_fields: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, qualified_name: _Optional[str] = ..., name: _Optional[str] = ..., object_id: _Optional[int] = ..., extends_target: _Optional[str] = ..., path: _Optional[str] = ..., absolute_path: _Optional[str] = ..., displayed_fields: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class Codeunit(_message.Message):
     __slots__ = ("qualified_name", "name", "object_id", "path", "absolute_path")

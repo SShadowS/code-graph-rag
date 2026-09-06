@@ -109,3 +109,36 @@ def test_has_key_relationships():
     ingestor, _ = _parse_and_extract()
     has_key = [r for r in ingestor.relationships if r[1] == cs.RelationshipType.HAS_KEY]
     assert len(has_key) == 2
+
+
+UNQUOTED_TABLE_AL = b"""
+table 50102 "Mixed Names"
+{
+    fields
+    {
+        field(1; "No."; Code[20]) { }
+        field(2; Name; Text[50]) { }
+    }
+    keys
+    {
+        key(PK; "No.") { Clustered = true; }
+        key(K2; "No.", Name) { }
+    }
+}
+"""
+
+
+def test_unquoted_field_name_extracted():
+    ingestor, _ = _parse_and_extract(UNQUOTED_TABLE_AL)
+    names = {n[2][cs.KEY_NAME] for n in ingestor.nodes if n[0] == cs.NodeLabel.FIELD}
+    assert names == {"No.", "Name"}
+
+
+def test_key_field_list_keeps_unquoted_names():
+    ingestor, _ = _parse_and_extract(UNQUOTED_TABLE_AL)
+    keys = {
+        n[2][cs.KEY_NAME]: n[2]["fields"]
+        for n in ingestor.nodes
+        if n[0] == cs.NodeLabel.KEY
+    }
+    assert keys["K2"] == ["No.", "Name"]

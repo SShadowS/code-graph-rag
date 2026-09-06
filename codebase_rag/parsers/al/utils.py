@@ -85,3 +85,20 @@ def collect_descendants(node: ASTNode, type_name: str) -> list[ASTNode]:
             result.append(child)
         result.extend(collect_descendants(child, type_name))
     return result
+
+
+def strip_quotes(text: str) -> str:
+    if text.startswith('"') and text.endswith('"'):
+        return text[1:-1]
+    return text
+
+
+def named_field_text(node: ASTNode, field_name: str) -> str | None:
+    child = node.child_by_field_name(field_name)
+    if child is None or not child.text:
+        return None
+    return strip_quotes(child.text.decode())
+
+
+def named_field_node(node: ASTNode, field_name: str) -> ASTNode | None:
+    return node.child_by_field_name(field_name)
