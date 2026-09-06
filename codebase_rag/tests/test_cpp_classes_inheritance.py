@@ -1360,10 +1360,13 @@ void testTemplateInheritance() {
     )
 
     for relationship in comprehensive_inherits:
-        assert len(relationship.args) == 3, (
-            "Inheritance relationship should have 3 args"
+        # from_spec, "INHERITS", to_spec, and a base_index property dict so
+        # incremental rehydration can restore multiple-inheritance base order.
+        assert len(relationship.args) == 4, (
+            "Inheritance relationship should have 4 args (incl. base_index props)"
         )
         assert relationship.args[1] == "INHERITS", "Second arg should be 'INHERITS'"
+        assert "base_index" in relationship.args[3], "Fourth arg carries base_index"
 
         source_class = relationship.args[0][2]
         target_class = relationship.args[2][2]
@@ -1372,9 +1375,10 @@ void testTemplateInheritance() {
             f"Source class should contain test file name: {source_class}"
         )
 
-        assert isinstance(target_class, str) and target_class, (
+        assert isinstance(target_class, str), (
             f"Target should be non-empty string: {target_class}"
         )
+        assert target_class, f"Target should be non-empty string: {target_class}"
 
     assert defines_relationships, "Should still have DEFINES relationships"
 

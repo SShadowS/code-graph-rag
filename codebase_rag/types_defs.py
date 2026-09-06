@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, ItemsView, KeysView, Sequence
+from collections.abc import (
+    Awaitable,
+    Callable,
+    ItemsView,
+    KeysView,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -9,7 +16,14 @@ from typing import TYPE_CHECKING, NamedTuple, Protocol, TypedDict
 
 from prompt_toolkit.styles import Style
 
-from .constants import NodeLabel, RelationshipType, SupportedLanguage
+from .constants import (
+    DUPLICATES_MAX_CANDIDATE_PAIRS,
+    DUPLICATES_MAX_SIMILAR_GROUPS,
+    AuditCheck,
+    NodeLabel,
+    RelationshipType,
+    SupportedLanguage,
+)
 
 if TYPE_CHECKING:
     from tree_sitter import Language, Node, Parser, Query
@@ -20,6 +34,12 @@ type LanguageLoader = Callable[[], Language] | None
 
 PropertyValue = str | int | float | bool | list[str] | None
 PropertyDict = dict[str, PropertyValue]
+
+# Any value a parsed JSON document can hold (a package.json manifest, a
+# tsconfig, an OpenAPI spec): recursive, so nested mappings stay typed.
+type JsonValue = (
+    str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
+)
 
 type ResultScalar = str | int | float | bool | None
 type ResultValue = ResultScalar | list[ResultScalar] | dict[str, ResultScalar]
@@ -32,6 +52,22 @@ class FunctionMatch(TypedDict):
     qualified_name: str
     parent_class: str | None
     line_number: int
+
+
+class StructuralSearchMatch(TypedDict):
+    file: str
+    line: int
+    column: int
+    end_line: int
+    end_column: int
+    text: str
+
+
+class StructuralReplaceChange(TypedDict):
+    file: str
+    matches: int
+    diff: str
+    applied: bool
 
 
 class NodeBatchRow(TypedDict):
@@ -95,6 +131,30 @@ class FunctionRegistryTrieProtocol(Protocol):
 
     def find_ending_with(self, suffix: str) -> list[QualifiedName]: ...
 
+    def register_unique_qn(
+        self, natural_qn: QualifiedName, start_line: int, start_col: int = 0
+    ) -> QualifiedName: ...
+
+    def variants(self, qualified_name: QualifiedName) -> list[QualifiedName]: ...
+
+    def mark_property(self, qualified_name: QualifiedName) -> None: ...
+
+    def is_property(self, qualified_name: QualifiedName) -> bool: ...
+
+    def property_names(self) -> set[str]: ...
+
+    def mark_abstract(self, qualified_name: QualifiedName) -> None: ...
+
+    def is_abstract(self, qualified_name: QualifiedName) -> bool: ...
+
+    def mark_callable_params(
+        self, qualified_name: QualifiedName, params: dict[str, int]
+    ) -> None: ...
+
+    def callable_params(
+        self, qualified_name: QualifiedName
+    ) -> dict[str, int] | None: ...
+
 
 class ASTCacheProtocol(Protocol):
     def __setitem__(self, key: Path, value: tuple[Node, SupportedLanguage]) -> None: ...
@@ -103,6 +163,7 @@ class ASTCacheProtocol(Protocol):
     def __delitem__(self, key: Path) -> None: ...
     def __contains__(self, key: Path) -> bool: ...
     def items(self) -> ItemsView[Path, tuple[Node, SupportedLanguage]]: ...
+    def load(self, key: Path) -> tuple[Node, SupportedLanguage] | None: ...
 
 
 class ColumnDescriptor(Protocol):
@@ -186,6 +247,11 @@ class GraphSummary(TypedDict):
     metadata: GraphMetadata
 
 
+class QueryJsonOutput(TypedDict):
+    query: str
+    response: str
+
+
 class EmbeddingQueryResult(TypedDict):
     node_id: int
     qualified_name: str
@@ -256,14 +322,20 @@ class AgentLoopUI(NamedTuple):
     panel_title: str
 
 
-ORANGE_STYLE = Style.from_dict({"": "#ff8c00"})
+ORANGE_STYLE = Style.from_dict(
+    {
+        "": "#ff8c00",
+        "bottom-toolbar": "noreverse fg:#888888",
+        "bottom-toolbar.text": "noreverse fg:#888888",
+    }
+)
 
 OPTIMIZATION_LOOP_UI = AgentLoopUI(
-    status_message="[bold green]Agent is analyzing codebase... (Press Ctrl+C to cancel)[/bold green]",
+    status_message="[bold green]Agent is analysing codebase... (Press Ctrl+C to cancel)[/bold green]",
     cancelled_log="ASSISTANT: [Analysis was cancelled]",
-    approval_prompt="Do you approve this optimization?",
-    denial_default="User rejected this optimization without feedback",
-    panel_title="[bold green]Optimization Agent[/bold green]",
+    approval_prompt="Do you approve this optimisation?",
+    denial_default="User rejected this optimisation without feedback",
+    panel_title="[bold green]Optimisation Agent[/bold green]",
 )
 
 CHAT_LOOP_UI = AgentLoopUI(
@@ -285,17 +357,21 @@ class LanguageImport(NamedTuple):
 class ToolNames(NamedTuple):
     query_graph: str
     read_file: str
-    analyze_document: str
     semantic_search: str
     create_file: str
     edit_file: str
     shell_command: str
+    # Whether semantic_search is actually registered. The MCP path omits it when
+    # the vector backend is unavailable, and the prompt must not tell the model
+    # to start with a tool that is absent from its schema (issue #1201).
+    has_semantic_search: bool = True
 
 
 class ConfirmationToolNames(NamedTuple):
     replace_code: str
     create_file: str
     shell_command: str
+    structural_replace: str
 
 
 class ReplaceCodeArgs(TypedDict, total=False):
@@ -313,6 +389,13 @@ class ShellCommandArgs(TypedDict, total=False):
     command: str
 
 
+class StructuralReplaceArgs(TypedDict, total=False):
+    pattern: str
+    rewrite: str
+    language: str
+    dry_run: bool
+
+
 @dataclass
 class RawToolArgs:
     file_path: str = ""
@@ -320,9 +403,13 @@ class RawToolArgs:
     replacement_code: str = ""
     content: str = ""
     command: str = ""
+    pattern: str = ""
+    rewrite: str = ""
+    language: str = ""
+    dry_run: bool = True
 
 
-ToolArgs = ReplaceCodeArgs | CreateFileArgs | ShellCommandArgs
+ToolArgs = ReplaceCodeArgs | CreateFileArgs | ShellCommandArgs | StructuralReplaceArgs
 
 
 class LanguageQueries(TypedDict):
@@ -331,6 +418,7 @@ class LanguageQueries(TypedDict):
     calls: Query | None
     imports: Query | None
     locals: Query | None
+    highlights: Query | None
     config: LanguageSpec
     language: Language
     parser: Parser
@@ -344,13 +432,17 @@ class FunctionNodeProps(TypedDict, total=False):
     docstring: str | None
 
 
-MCPToolArguments = dict[str, str | int | None]
+# float admits find_duplicate_code's 0-1 similarity threshold (issue #1342).
+# bool is listed for documentation only, being already a subtype of int, and
+# structural_replace's dry_run default has relied on that since it was added.
+MCPToolArguments = dict[str, str | int | float | bool | None]
 
 
 class MCPInputSchemaProperty(TypedDict, total=False):
     type: str
     description: str
-    default: str
+    default: str | int | float | bool
+    items: dict[str, str]
 
 
 MCPInputSchemaProperties = dict[str, MCPInputSchemaProperty]
@@ -384,6 +476,89 @@ class CodeSnippetResultDict(TypedDict, total=False):
     docstring: str | None
     found: bool
     error_message: str | None
+    error: str
+
+
+class DeadCodeRow(TypedDict):
+    label: str
+    name: str
+    qualified_name: str
+    start_line: int
+    end_line: int
+
+
+class DeadCodeConfig(NamedTuple):
+    include_tests: bool
+    include_classes: bool
+    root_decorators: frozenset[str]
+    entry_points: tuple[str, ...]
+    test_patterns: tuple[str, ...]
+    exclude_patterns: tuple[str, ...] = ()
+    # Drop CALLS/REFERENCES edges below this confidence before the walk
+    # (issue #1526); None keeps every edge.
+    min_resolution: str | None = None
+
+
+class AstFingerprintResult(NamedTuple):
+    """Structural fingerprints of one function body's skeleton."""
+
+    fingerprint: str
+    node_count: int
+    branch_fingerprints: list[str]
+
+
+class DuplicatesConfig(NamedTuple):
+    threshold: float
+    min_nodes: int
+    exact_only: bool
+    exclude_patterns: tuple[str, ...] = ()
+    max_similar_groups: int = DUPLICATES_MAX_SIMILAR_GROUPS
+    max_candidate_pairs: int = DUPLICATES_MAX_CANDIDATE_PAIRS
+
+
+class DuplicateMember(TypedDict):
+    label: str
+    qualified_name: str
+    name: str
+    path: str
+    start_line: int
+    end_line: int
+
+
+class DuplicateGroup(TypedDict):
+    kind: str
+    similarity: float
+    node_count: int
+    members: list[DuplicateMember]
+
+
+class DuplicatesReport(NamedTuple):
+    groups: list[DuplicateGroup]
+    skipped_symbols: int
+    # True when similar-group enumeration stopped at the configured cap:
+    # qualifying groups may be missing and every consumer must say so.
+    truncated: bool
+    # Fingerprint-bearing symbols the scan actually examined. Zero with a
+    # positive skipped count means the graph predates fingerprint stamping
+    # (indexed before the feature): "no duplicates" would be vacuous and the
+    # CLI recommends a re-index instead.
+    analyzed_symbols: int = 0
+
+
+class GraphQueryClient(Protocol):
+    def fetch_all(
+        self, query: str, params: dict[str, PropertyValue] | None = None
+    ) -> list[ResultRow]: ...
+
+
+class ReingestToolResult(TypedDict, total=False):
+    """MCP ``reingest`` payload: what was re-parsed and how long it took."""
+
+    reparsed: list[str]
+    affected: list[str]
+    removed: list[str]
+    skipped: list[str]
+    elapsed_ms: float
     error: str
 
 
@@ -430,14 +605,274 @@ class NodeSchema(NamedTuple):
     properties: str
 
 
+class GraphNodeRecord(NamedTuple):
+    label: str
+    properties: PropertyDict
+
+
+type RelEndpointSpec = tuple[str, str, PropertyValue]
+
+
+class GraphRelRecord(NamedTuple):
+    from_spec: RelEndpointSpec
+    rel_type: str
+    to_spec: RelEndpointSpec
+
+
+class AuditViolation(NamedTuple):
+    check: AuditCheck
+    detail: str
+
+
+class DeferredParentLink(NamedTuple):
+    """Containment edge whose non-module parent must exist before emission.
+
+    Parents can be registered by a later pass than the child (methods land in
+    the class pass after the function pass; forward declarations register
+    last), so verification waits until every pass finishes. A parent qn that
+    never registers is a phantom the database would drop, so the child
+    anchors to its registered lexical fallback when one is known (a nested
+    prototype assignment belongs to its enclosing function), else its module.
+    """
+
+    parent_label_guess: str
+    parent_qn: str
+    child_label: str
+    child_qn: str
+    module_qn: str
+    rel_type: str = RelationshipType.DEFINES.value
+    fallback_label: str | None = None
+    fallback_qn: str | None = None
+    # Span key of the parent's NODE when the guess qn cannot carry the
+    # registered identity (a C# overload registers signature-suffixed, so
+    # the parameterless sibling shadows the guess); the resolver prefers
+    # this span's recorded location over the qn match.
+    parent_span: tuple[str, int, int] | None = None
+
+
+# (module_qn, 1-based start line, 0-based start column) of a function
+# node; the span identifies the function even on shared lines.
+type FunctionSpanKey = tuple[str, int, int]
+
+
+class FunctionLocation(NamedTuple):
+    """Where the definition pass put a C++ function/method node.
+
+    Keyed by (module_qn, start_line, start_col) so Pass-3 call attribution
+    reuses the exact label and qn Pass 2 registered instead of re-deriving
+    them from the AST; the two walks diverge on preprocessor-distorted class
+    bodies and every divergence is a phantom caller the database drops
+    (issue #652). The column in the key keeps same-line functions (a one-line
+    curried arrow, minified `exports.a = ...; exports.b = ...`) from evicting
+    or masking each other's records.
+    """
+
+    label: str
+    qualified_name: str
+    container_qn: str | None
+    # False when the qn was GENERATED (anonymous_row_col, iife_*): Pass-3
+    # lets an unnamed JS/TS function expression adopt a NAMED record (the
+    # node registered for `exports.f = function`), while a generated record
+    # keeps the historical bubble-to-module attribution.
+    is_named: bool = True
+
+
+class FunctionLocations(dict[FunctionSpanKey, FunctionLocation]):
+    """`function_locations` that knows which module each span came from.
+
+    A reused GraphUpdater re-parses a module into a map still holding the
+    previous run's spans, and the key is (module_qn, start_line, start_col):
+    a function renamed in place keeps its key, so the stale record survives
+    and the first-claim guard blocks the live registration (issue #1019).
+
+    Nine call sites across the definition and class passes write into this
+    map, so the module index is maintained by the map itself rather than at
+    each of them, where the next new write site would silently miss it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._by_module: dict[str, set[FunctionSpanKey]] = {}
+
+    def __setitem__(self, key: FunctionSpanKey, value: FunctionLocation) -> None:
+        super().__setitem__(key, value)
+        self._by_module.setdefault(key[0], set()).add(key)
+
+    def update(  # type: ignore[override]
+        self, other: Mapping[FunctionSpanKey, FunctionLocation]
+    ) -> None:
+        # dict.update bypasses __setitem__ on a subclass, which would leave
+        # the index blind to whatever it wrote.
+        for key, value in other.items():
+            self[key] = value
+
+    def setdefault(  # type: ignore[override]
+        self, key: FunctionSpanKey, default: FunctionLocation
+    ) -> FunctionLocation:
+        # dict.setdefault bypasses __setitem__ just like dict.update does, so a
+        # record written through it would be invisible to the module index and
+        # survive drop_module -- the stale-record bug this map exists to stop.
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def drop_module(self, module_qn: str) -> None:
+        """Forget every span record a module contributed, before it re-parses."""
+        for key in self._by_module.pop(module_qn, ()):
+            super().pop(key, None)
+
+
+class CppDefinitionSpan(NamedTuple):
+    """Full line span of a C/C++ function or method the tree-sitter pass ingested.
+
+    Recorded per relative file path so the hybrid C++ frontend can attribute a
+    macro use (a TU-level preprocessing entity with only a location) to the
+    tightest enclosing TREE-SITTER definition after Pass 2; libclang's own
+    spans carry wrong-scheme qns wherever macros hide namespaces.
+    """
+
+    start_line: int
+    end_line: int
+    label: str
+    qualified_name: str
+
+
+class PendingMacroCall(NamedTuple):
+    """A macro use the hybrid C++ frontend saw but cannot attribute yet.
+
+    The caller is resolvable only after the tree-sitter pass has recorded its
+    definition spans; a use outside every span attributes to the fallback
+    Module, mirroring the module-caller rule for ordinary calls.
+    """
+
+    rel_path: str
+    line: int
+    callee_qn: str
+    fallback_module_qn: str
+
+
+class PendingExpansionCall(NamedTuple):
+    """A call that exists only after macro expansion, seen by the hybrid frontend.
+
+    The call's text lives inside a macro definition body, so tree-sitter never
+    sees it at the expansion site. Both ends carry only locations: the caller
+    joins to the tightest tree-sitter definition span containing the expansion
+    site (falling back to the Module), the callee to the span containing the
+    referenced definition (dropped when none exists) -- so the emitted CALLS
+    edge is tree-sitter-scheme on both ends.
+    """
+
+    caller_rel_path: str
+    caller_line: int
+    callee_rel_path: str
+    callee_line: int
+    fallback_module_qn: str
+
+
+class DeferredCppInherit(NamedTuple):
+    """C++ INHERITS edge held back until every class is registered.
+
+    A base written in another header cannot resolve at parse time, so the
+    edge is emitted after Pass 2 with the base resolved namespace-scoped
+    across files; an unresolvable base emits no edge rather than a phantom
+    the database would drop.
+    """
+
+    child_label: str
+    child_qn: str
+    base_name: str
+    guess_qn: str
+    namespace_path: str
+    base_index: int
+
+
+class DeferredInherit(NamedTuple):
+    """Non-C++ INHERITS/IMPLEMENTS edge held back until every class is registered.
+
+    A parent that does not resolve at parse time is anchored to the child's
+    own module qn as a guess; the edge is emitted after Pass 2 with the guess
+    re-resolved against the full registry. An unresolvable parent emits no
+    edge rather than a phantom the database would drop.
+
+    `alt_parent_qn` is a second spelling to try when the first names no
+    registered node: a written path can be exact about where to look and
+    still point at a module that only RE-EXPORTS the parent, where the
+    name-anchored guess is what finds the declaring one.
+    """
+
+    rel_type: RelationshipType
+    child_qn: str
+    parent_qn: str
+    module_qn: str
+    base_index: int
+    language: SupportedLanguage
+    alt_parent_qn: str | None = None
+
+
+class RustTraitImpl(NamedTuple):
+    """A Rust `impl Trait for Type` block and the methods it ingested.
+
+    Whether the trait belongs to another crate decides whether those methods
+    are dead-code roots (nothing first-party can call them), and that is only
+    knowable once every first-party trait is registered, so the block is held
+    back for resolve_deferred_inherits to judge (issue #1048).
+    """
+
+    entry: DeferredInherit
+    spelling: str
+    method_qns: list[str]
+
+
+class PendingTypeFact(NamedTuple):
+    """A definition whose annotations still need resolving into edges (#1527)."""
+
+    label: str
+    qualified_name: str
+    module_qn: str
+    return_type: str | None
+    param_types: list[str] | None
+
+
+class DeferredImportEdge(NamedTuple):
+    """IMPORTS edge held back until every file is parsed.
+
+    An internal-looking target is only real if some file (or inline module)
+    actually yields that module qn; verification happens against the full
+    module registry, and a target that resolves nowhere emits no edge.
+    """
+
+    module_qn: str
+    full_name: str
+    language: SupportedLanguage
+    # Import-site edge properties (statement span, alias, imported name;
+    # issue #1522), or None for an import shape that records no site.
+    site: PropertyDict | None = None
+
+
+class ReingestReport(NamedTuple):
+    """What one GraphUpdater.reingest() call touched (issue #1524)."""
+
+    reparsed: tuple[str, ...]
+    affected: tuple[str, ...]
+    removed: tuple[str, ...]
+    skipped: tuple[str, ...]
+    elapsed_ms: float
+
+
 class RelationshipSchema(NamedTuple):
     sources: tuple[NodeLabel, ...]
     rel_type: RelationshipType
     targets: tuple[NodeLabel, ...]
 
 
+# shared property string for the ast-grep finding node labels (issue #413)
+_FINDING_NODE_PROPS = (
+    "{qualified_name: string, name: string, message: string, "
+    "start_line: int, end_line: int, path: string, snippet: string?}"
+)
+
 NODE_SCHEMAS: tuple[NodeSchema, ...] = (
-    NodeSchema(NodeLabel.PROJECT, "{name: string}"),
+    NodeSchema(NodeLabel.PROJECT, "{name: string, root_path: string?}"),
     NodeSchema(
         NodeLabel.PACKAGE,
         "{qualified_name: string, name: string, path: string, absolute_path: string}",
@@ -445,82 +880,104 @@ NODE_SCHEMAS: tuple[NodeSchema, ...] = (
     NodeSchema(NodeLabel.FOLDER, "{path: string, name: string, absolute_path: string}"),
     NodeSchema(
         NodeLabel.FILE,
-        "{path: string, name: string, extension: string, absolute_path: string}",
+        "{path: string, name: string, extension: string?, absolute_path: string}",
     ),
     NodeSchema(
         NodeLabel.MODULE,
-        "{qualified_name: string, name: string, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, path: string, absolute_path: string, flow_covered: boolean?, generated: boolean?, generator: string?, start_line: int?, end_line: int?, decorators: list[string]?, rust_cfg_test_mods: list[string]?, rust_ungated_mods: list[string]?, front_matter: list[string]?, unresolved_specifiers: list[string]?}",
     ),
     NodeSchema(
         NodeLabel.CLASS,
-        "{qualified_name: string, name: string, decorators: list[string], path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, modifiers: list[string], decorators: list[string], path: string, absolute_path: string, start_col: int?, start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?}",
     ),
     NodeSchema(
         NodeLabel.FUNCTION,
-        "{qualified_name: string, name: string, decorators: list[string], path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, modifiers: list[string], decorators: list[string], path: string, absolute_path: string, start_col: int?, name_start_line: int?, name_start_col: int?, start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?, is_macro: boolean?, positional_params: list[string]?, return_type: string?, param_types: list[string]?, ast_fingerprint: string?, ast_fingerprint_nodes: int?, ast_branch_fingerprints: list[string]?}",
     ),
     NodeSchema(
         NodeLabel.METHOD,
-        "{qualified_name: string, name: string, decorators: list[string], path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, modifiers: list[string], decorators: list[string], path: string, absolute_path: string, start_col: int?, name_start_line: int?, name_start_col: int?, start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?, is_property: boolean?, overrides_external: boolean?, positional_params: list[string]?, return_type: string?, param_types: list[string]?, ast_fingerprint: string?, ast_fingerprint_nodes: int?, ast_branch_fingerprints: list[string]?}",
     ),
     NodeSchema(
         NodeLabel.INTERFACE,
-        "{qualified_name: string, name: string, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, path: string, absolute_path: string, modifiers: list[string]?, decorators: list[string]?, start_col: int?, start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?}",
     ),
     NodeSchema(
         NodeLabel.ENUM,
-        "{qualified_name: string, name: string, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, path: string, absolute_path: string, modifiers: list[string]?, decorators: list[string]?, start_col: int?, start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?}",
     ),
-    NodeSchema(NodeLabel.TYPE, "{qualified_name: string, name: string}"),
-    NodeSchema(NodeLabel.UNION, "{qualified_name: string, name: string}"),
+    NodeSchema(
+        NodeLabel.TYPE,
+        "{qualified_name: string, name: string, path: string?, absolute_path: string?, modifiers: list[string]?, decorators: list[string]?, start_col: int?, start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?}",
+    ),
+    NodeSchema(
+        NodeLabel.UNION,
+        "{qualified_name: string, name: string, path: string?, absolute_path: string?, modifiers: list[string]?, decorators: list[string]?, start_col: int?, start_line: int?, end_line: int?, docstring: string?, is_exported: boolean?}",
+    ),
     NodeSchema(
         NodeLabel.MODULE_INTERFACE,
-        "{qualified_name: string, name: string, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, path: string, absolute_path: string, module_type: string}",
     ),
     NodeSchema(
         NodeLabel.MODULE_IMPLEMENTATION,
-        "{qualified_name: string, name: string, path: string, absolute_path: string, implements_module: string}",
+        "{qualified_name: string, name: string, path: string, absolute_path: string, implements_module: string, module_type: string}",
     ),
-    NodeSchema(NodeLabel.EXTERNAL_PACKAGE, "{name: string, version_spec: string}"),
+    NodeSchema(NodeLabel.EXTERNAL_PACKAGE, "{name: string}"),
+    NodeSchema(
+        NodeLabel.EXTERNAL_MODULE,
+        "{qualified_name: string, name: string, path: string}",
+    ),
+    NodeSchema(
+        NodeLabel.RESOURCE,
+        "{qualified_name: string, name: string, kind: string}",
+    ),
+    NodeSchema(
+        NodeLabel.SECTION,
+        "{qualified_name: string, name: string, heading_level: int, "
+        "start_line: int, end_line: int, path: string, absolute_path: string}",
+    ),
+    NodeSchema(NodeLabel.PATTERN, _FINDING_NODE_PROPS),
+    NodeSchema(NodeLabel.CODE_SMELL, _FINDING_NODE_PROPS),
+    NodeSchema(NodeLabel.SECURITY_ISSUE, _FINDING_NODE_PROPS),
     NodeSchema(
         NodeLabel.TABLE,
-        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, object_id: int, path: string, absolute_path: string}",
     ),
     NodeSchema(
         NodeLabel.TABLE_EXTENSION,
-        "{qualified_name: string, name: string, object_id: integer, extends_target: string, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, object_id: int, extends_target: string, path: string, absolute_path: string}",
     ),
     NodeSchema(
         NodeLabel.PAGE,
-        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, object_id: int, path: string, absolute_path: string}",
     ),
     NodeSchema(
         NodeLabel.PAGE_EXTENSION,
-        "{qualified_name: string, name: string, object_id: integer, extends_target: string, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, object_id: int, extends_target: string, path: string, absolute_path: string}",
     ),
     NodeSchema(
         NodeLabel.CODEUNIT,
-        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, object_id: int, path: string, absolute_path: string}",
     ),
     NodeSchema(
         NodeLabel.REPORT,
-        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, object_id: int, path: string, absolute_path: string}",
     ),
     NodeSchema(
         NodeLabel.REPORT_EXTENSION,
-        "{qualified_name: string, name: string, object_id: integer, extends_target: string, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, object_id: int, extends_target: string, path: string, absolute_path: string}",
     ),
     NodeSchema(
         NodeLabel.ENUM_EXTENSION,
-        "{qualified_name: string, name: string, object_id: integer, extends_target: string, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, object_id: int, extends_target: string, path: string, absolute_path: string}",
     ),
     NodeSchema(
         NodeLabel.AL_QUERY,
-        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, object_id: int, path: string, absolute_path: string}",
     ),
     NodeSchema(
         NodeLabel.XMLPORT,
-        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, object_id: int, path: string, absolute_path: string}",
     ),
     NodeSchema(
         NodeLabel.CONTROL_ADDIN,
@@ -528,7 +985,7 @@ NODE_SCHEMAS: tuple[NodeSchema, ...] = (
     ),
     NodeSchema(
         NodeLabel.PERMISSION_SET,
-        "{qualified_name: string, name: string, object_id: integer, path: string, absolute_path: string}",
+        "{qualified_name: string, name: string, object_id: int, path: string, absolute_path: string}",
     ),
     NodeSchema(
         NodeLabel.ENTITLEMENT,
@@ -552,7 +1009,7 @@ NODE_SCHEMAS: tuple[NodeSchema, ...] = (
     ),
     NodeSchema(
         NodeLabel.FIELD,
-        "{qualified_name: string, name: string, field_id: integer, field_type: string}",
+        "{qualified_name: string, name: string, field_id: int, field_type: string}",
     ),
     NodeSchema(
         NodeLabel.KEY,
@@ -560,11 +1017,11 @@ NODE_SCHEMAS: tuple[NodeSchema, ...] = (
     ),
     NodeSchema(
         NodeLabel.ACTION,
-        "{qualified_name: string, name: string}",
+        "{qualified_name: string, name: string, start_line: int, end_line: int}",
     ),
     NodeSchema(
         NodeLabel.DATA_ITEM,
-        "{qualified_name: string, name: string, source_table: string}",
+        "{qualified_name: string, name: string, source_table: string, start_line: int, end_line: int}",
     ),
     NodeSchema(
         NodeLabel.EXTERNAL_OBJECT,
@@ -572,6 +1029,44 @@ NODE_SCHEMAS: tuple[NodeSchema, ...] = (
     ),
 )
 
+
+class RelationshipPropertySchema(NamedTuple):
+    rel_types: tuple[RelationshipType, ...]
+    properties: str
+
+
+# Edge properties, documented for the query-generation prompt (issue #1522):
+# every CALLS/REFERENCES/INSTANTIATES edge locates its producing expression
+# and every IMPORTS edge its statement; FLOWS_TO carries its conduit shape.
+RELATIONSHIP_PROPERTY_SCHEMAS: tuple[RelationshipPropertySchema, ...] = (
+    RelationshipPropertySchema(
+        (
+            RelationshipType.CALLS,
+            RelationshipType.REFERENCES,
+            RelationshipType.INSTANTIATES,
+        ),
+        "{line: int?, col: int?, end_line: int?, end_col: int?, "
+        "arg_count: int?, kwarg_names: list[string]?, resolution: string?, unlocatable: boolean?, dispatch_literal: boolean?}",
+    ),
+    RelationshipPropertySchema(
+        (RelationshipType.IMPORTS,),
+        "{line: int?, col: int?, end_line: int?, end_col: int?, "
+        "alias: string?, imported_name: string?}",
+    ),
+    RelationshipPropertySchema(
+        (RelationshipType.FLOWS_TO,),
+        "{kind: string, via: string?}",
+    ),
+)
+
+# What a return or parameter annotation can name (issue #1527).
+_TYPE_NODE_LABELS = (
+    NodeLabel.CLASS,
+    NodeLabel.INTERFACE,
+    NodeLabel.ENUM,
+    NodeLabel.TYPE,
+    NodeLabel.UNION,
+)
 
 RELATIONSHIP_SCHEMAS: tuple[RelationshipSchema, ...] = (
     RelationshipSchema(
@@ -595,19 +1090,39 @@ RELATIONSHIP_SCHEMAS: tuple[RelationshipSchema, ...] = (
         (NodeLabel.MODULE,),
     ),
     RelationshipSchema(
-        (NodeLabel.MODULE,),
-        RelationshipType.DEFINES,
-        (NodeLabel.CLASS, NodeLabel.FUNCTION),
+        (NodeLabel.MODULE, NodeLabel.SECTION),
+        RelationshipType.CONTAINS_SECTION,
+        (NodeLabel.SECTION,),
     ),
     RelationshipSchema(
-        (NodeLabel.CLASS,),
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.CLASS),
+        RelationshipType.DEFINES,
+        (
+            NodeLabel.CLASS,
+            NodeLabel.FUNCTION,
+            NodeLabel.METHOD,
+            NodeLabel.ENUM,
+            NodeLabel.INTERFACE,
+            NodeLabel.TYPE,
+            NodeLabel.UNION,
+            NodeLabel.MODULE,
+        ),
+    ),
+    RelationshipSchema(
+        (
+            NodeLabel.CLASS,
+            NodeLabel.INTERFACE,
+            NodeLabel.ENUM,
+            NodeLabel.TYPE,
+            NodeLabel.UNION,
+        ),
         RelationshipType.DEFINES_METHOD,
         (NodeLabel.METHOD,),
     ),
     RelationshipSchema(
         (NodeLabel.MODULE,),
         RelationshipType.IMPORTS,
-        (NodeLabel.MODULE,),
+        (NodeLabel.MODULE, NodeLabel.EXTERNAL_MODULE),
     ),
     RelationshipSchema(
         (NodeLabel.MODULE,),
@@ -625,19 +1140,46 @@ RELATIONSHIP_SCHEMAS: tuple[RelationshipSchema, ...] = (
         (NodeLabel.MODULE_IMPLEMENTATION,),
     ),
     RelationshipSchema(
-        (NodeLabel.CLASS,),
+        (NodeLabel.CLASS, NodeLabel.INTERFACE, NodeLabel.FUNCTION),
         RelationshipType.INHERITS,
-        (NodeLabel.CLASS,),
+        # ExternalModule: a positively-external base (typing.Protocol,
+        # js builtin.Error) keeps its edge by targeting the same external
+        # node the import pass mints, mirroring Module IMPORTS.
+        (
+            NodeLabel.CLASS,
+            NodeLabel.INTERFACE,
+            NodeLabel.FUNCTION,
+            NodeLabel.EXTERNAL_MODULE,
+        ),
     ),
     RelationshipSchema(
-        (NodeLabel.CLASS,),
+        (NodeLabel.CLASS, NodeLabel.ENUM),
         RelationshipType.IMPLEMENTS,
-        (NodeLabel.INTERFACE,),
+        # CLASS/ENUM targets: Dart has no `interface` keyword, so `implements
+        # X` names a concrete class (its implicit interface) or an enum.
+        (
+            NodeLabel.INTERFACE,
+            NodeLabel.CLASS,
+            NodeLabel.ENUM,
+            NodeLabel.EXTERNAL_MODULE,
+        ),
     ),
     RelationshipSchema(
-        (NodeLabel.METHOD,),
+        # A method-body anonymous-class override is a Function node, so it
+        # can source an OVERRIDES edge onto the base Method.
+        (NodeLabel.METHOD, NodeLabel.FUNCTION),
         RelationshipType.OVERRIDES,
         (NodeLabel.METHOD,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.RETURNS,
+        _TYPE_NODE_LABELS,
+    ),
+    RelationshipSchema(
+        (NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.ACCEPTS,
+        _TYPE_NODE_LABELS,
     ),
     RelationshipSchema(
         (NodeLabel.MODULE_IMPLEMENTATION,),
@@ -650,9 +1192,59 @@ RELATIONSHIP_SCHEMAS: tuple[RelationshipSchema, ...] = (
         (NodeLabel.EXTERNAL_PACKAGE,),
     ),
     RelationshipSchema(
-        (NodeLabel.FUNCTION, NodeLabel.METHOD),
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD),
         RelationshipType.CALLS,
-        (NodeLabel.FUNCTION, NodeLabel.METHOD),
+        (NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.ENUM, NodeLabel.TYPE),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.REFERENCES,
+        (NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.CLASS),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.INSTANTIATES,
+        (NodeLabel.CLASS,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.READS_FROM,
+        (NodeLabel.RESOURCE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD),
+        RelationshipType.WRITES_TO,
+        (NodeLabel.RESOURCE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.RESOURCE),
+        RelationshipType.FLOWS_TO,
+        (NodeLabel.MODULE, NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.RESOURCE),
+    ),
+    RelationshipSchema(
+        (NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.FILE),
+        RelationshipType.EXPOSES,
+        (NodeLabel.RESOURCE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.RESOURCE,),
+        RelationshipType.RESOLVES_TO,
+        (NodeLabel.RESOURCE,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE,),
+        RelationshipType.IMPLEMENTS_PATTERN,
+        (NodeLabel.PATTERN,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE,),
+        RelationshipType.HAS_SMELL,
+        (NodeLabel.CODE_SMELL,),
+    ),
+    RelationshipSchema(
+        (NodeLabel.MODULE,),
+        RelationshipType.HAS_VULNERABILITY,
+        (NodeLabel.SECURITY_ISSUE,),
     ),
     RelationshipSchema(
         (NodeLabel.CLASS,),

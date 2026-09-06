@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol, runtime_checkable
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,127 +14,128 @@ from watchdog.events import (
 from realtime_updater import CodeChangeEventHandler
 
 
-@runtime_checkable
-class _AnyProtocol(Protocol):
-    pass
-
-
-@pytest.fixture(autouse=True)
-def _bypass_protocol_check(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("realtime_updater.QueryProtocol", _AnyProtocol)
-
-
 @pytest.fixture
 def event_handler(mock_updater: MagicMock) -> CodeChangeEventHandler:
-    handler = CodeChangeEventHandler(mock_updater)
+    handler = CodeChangeEventHandler(mock_updater, debounce_seconds=0)
     handler.ignore_patterns = handler.ignore_patterns - {"tmp", "temp"}
     return handler
+
+
+# The watcher owns event filtering and debouncing only; everything a change
+# does to the graph (delete, re-parse, scoped call resolution, restore) is
+# GraphUpdater.reingest, shared with the MCP tool (issue #1524). These tests
+# pin the hand-off, and test_reingest.py pins what reingest itself does.
 
 
 def test_file_creation_flow(
     event_handler: CodeChangeEventHandler, mock_updater: MagicMock, temp_repo: Path
 ) -> None:
-    """Test that creating a new file triggers parsing and ingestion."""
+    """Creating a file re-ingests exactly that file."""
     test_file = temp_repo / "new_file.py"
     test_file.write_text(encoding="utf-8", data="def new_func(): pass")
-    event = FileCreatedEvent(str(test_file))
 
-    event_handler.dispatch(event)
+    event_handler.dispatch(FileCreatedEvent(str(test_file)))
 
-    # (H) 3 execute_write calls: DELETE_MODULE, DELETE_FILE, DELETE_CALLS
-    assert mock_updater.ingestor.execute_write.call_count == 3
-    mock_updater.factory.definition_processor.process_file.assert_called_once_with(
-        test_file,
-        "python",
-        mock_updater.queries,
-        mock_updater.factory.structure_processor.structural_elements,
-    )
-    mock_updater.ingestor.flush_all.assert_called_once()
+    mock_updater.reingest.assert_called_once_with((test_file,))
 
 
 def test_file_modification_flow(
     event_handler: CodeChangeEventHandler, mock_updater: MagicMock, temp_repo: Path
 ) -> None:
-    """Test that modifying a file triggers removal and re-ingestion."""
+    """Modifying a file re-ingests exactly that file."""
     test_file = temp_repo / "existing_file.py"
     test_file.touch()
-    event = FileModifiedEvent(str(test_file))
 
-    event_handler.dispatch(event)
+    event_handler.dispatch(FileModifiedEvent(str(test_file)))
 
-    # (H) 3 execute_write calls: DELETE_MODULE, DELETE_FILE, DELETE_CALLS
-    assert mock_updater.ingestor.execute_write.call_count == 3
-    mock_updater.factory.definition_processor.process_file.assert_called_once_with(
-        test_file,
-        "python",
-        mock_updater.queries,
-        mock_updater.factory.structure_processor.structural_elements,
-    )
-    mock_updater.ingestor.flush_all.assert_called_once()
+    mock_updater.reingest.assert_called_once_with((test_file,))
 
 
 def test_file_deletion_flow(
     event_handler: CodeChangeEventHandler, mock_updater: MagicMock, temp_repo: Path
 ) -> None:
-    """Test that deleting a file triggers its removal from the graph."""
+    """Deleting a file removes it through the deleted channel.
+
+    A DELETE event names the removal explicitly rather than relying on the
+    file being absent: an atomic save can recreate the path before the
+    debounced handler runs, and the graph must still drop the old subtree.
+    """
     test_file = temp_repo / "deleted_file.py"
-    event = FileDeletedEvent(str(test_file))
 
-    event_handler.dispatch(event)
+    event_handler.dispatch(FileDeletedEvent(str(test_file)))
 
-    # (H) 3 execute_write calls: DELETE_MODULE, DELETE_FILE, DELETE_CALLS
-    assert mock_updater.ingestor.execute_write.call_count == 3
-    mock_updater.factory.definition_processor.process_file.assert_not_called()
-    mock_updater.ingestor.flush_all.assert_called_once()
+    mock_updater.reingest.assert_called_once_with((), deleted=(test_file,))
 
 
 def test_irrelevant_files_are_ignored(
     event_handler: CodeChangeEventHandler, mock_updater: MagicMock, temp_repo: Path
 ) -> None:
-    """Test that files in ignored directories are skipped."""
+    """Files in ignored directories never reach the updater."""
     ignored_dir = temp_repo / ".git"
     ignored_dir.mkdir()
     ignored_file = ignored_dir / "config"
     ignored_file.touch()
-    event = FileCreatedEvent(str(ignored_file))
 
-    event_handler.dispatch(event)
+    event_handler.dispatch(FileCreatedEvent(str(ignored_file)))
 
-    mock_updater.ingestor.execute_write.assert_not_called()
-    mock_updater.factory.definition_processor.process_file.assert_not_called()
-    mock_updater.ingestor.flush_all.assert_not_called()
+    mock_updater.reingest.assert_not_called()
 
 
 def test_directory_creation_is_ignored(
     event_handler: CodeChangeEventHandler, mock_updater: MagicMock, temp_repo: Path
 ) -> None:
-    """Test that creating a directory does not trigger any graph operations."""
-    test_dir = temp_repo / "new_dir"
-    event = DirCreatedEvent(str(test_dir))
+    """Creating a directory triggers no graph operation."""
+    event_handler.dispatch(DirCreatedEvent(str(temp_repo / "new_dir")))
 
-    event_handler.dispatch(event)
-
-    mock_updater.ingestor.execute_write.assert_not_called()
-    mock_updater.factory.definition_processor.process_file.assert_not_called()
-    mock_updater.ingestor.flush_all.assert_not_called()
+    mock_updater.reingest.assert_not_called()
 
 
-def test_non_code_files_create_file_nodes(
+def test_non_code_files_are_reingested_too(
     event_handler: CodeChangeEventHandler, mock_updater: MagicMock, temp_repo: Path
 ) -> None:
-    """Test that non-code files (like .md) create File nodes but skip AST parsing."""
+    """A non-code file (e.g. Markdown) still goes through reingest.
+
+    reingest routes it to the secondary tiers and creates its File node;
+    the watcher does not decide per extension.
+    """
     non_code_file = temp_repo / "document.md"
     non_code_file.write_text(encoding="utf-8", data="# Markdown file")
-    event = FileModifiedEvent(str(non_code_file))
 
-    event_handler.dispatch(event)
+    event_handler.dispatch(FileModifiedEvent(str(non_code_file)))
 
-    # (H) 3 execute_write calls: DELETE_MODULE, DELETE_FILE, DELETE_CALLS
-    assert mock_updater.ingestor.execute_write.call_count == 3
-    # (H) AST parsing is skipped for non-code files
-    mock_updater.factory.definition_processor.process_file.assert_not_called()
-    # (H) But File node creation IS called for all file types
-    mock_updater.factory.structure_processor.process_generic_file.assert_called_once_with(
-        non_code_file, "document.md"
-    )
-    mock_updater.ingestor.flush_all.assert_called_once()
+    mock_updater.reingest.assert_called_once_with((non_code_file,))
+
+
+def test_read_only_events_are_ignored(
+    event_handler: CodeChangeEventHandler, mock_updater: MagicMock, temp_repo: Path
+) -> None:
+    """An 'opened' or 'closed_no_write' event changes nothing."""
+    test_file = temp_repo / "read.py"
+    test_file.touch()
+    event = FileModifiedEvent(str(test_file))
+    event.event_type = "opened"  # type: ignore[misc]
+
+    event_handler._process_change(event)
+
+    mock_updater.reingest.assert_not_called()
+
+
+def test_a_refused_path_is_logged_and_later_events_still_run(
+    event_handler: CodeChangeEventHandler, mock_updater: MagicMock, temp_repo: Path
+) -> None:
+    """reingest refuses a path outside the repo with ValueError; the callback
+    must log it and keep serving events rather than die on the timer thread."""
+    outside = temp_repo / "escape.py"
+    outside.touch()
+    inside = temp_repo / "kept.py"
+    inside.touch()
+    mock_updater.reingest.side_effect = [
+        ValueError("Path is outside the repository: escape.py"),
+        None,
+    ]
+
+    event_handler.dispatch(FileModifiedEvent(str(outside)))
+    event_handler.dispatch(FileModifiedEvent(str(inside)))
+
+    assert mock_updater.reingest.call_count == 2
+    mock_updater.reingest.assert_called_with((inside,))

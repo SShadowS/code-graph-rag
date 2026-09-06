@@ -10,7 +10,7 @@ from .utils import build_al_qualified_name, object_body
 
 if TYPE_CHECKING:
     from ...services import IngestorProtocol
-    from ...types_defs import ASTNode
+    from ...types_defs import ASTNode, PropertyDict
 
 PROCEDURE_NODE_TYPES = frozenset(
     {
@@ -125,7 +125,7 @@ class AlProcedureExtractor:
                 object_type_label, object_id, object_name, name
             )
 
-            props: dict[str, str | int | None] = {
+            props: PropertyDict = {
                 cs.KEY_QUALIFIED_NAME: qn,
                 cs.KEY_NAME: name,
                 cs.KEY_START_LINE: child.start_point[0] + 1,

@@ -1,11 +1,12 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from rich.console import Console
 
-from .constants import SupportedLanguage
+from .constants import PermissionMode, SupportedLanguage
 from .types_defs import MCPHandlerType, MCPInputSchema, PropertyValue
 
 if TYPE_CHECKING:
@@ -15,11 +16,37 @@ if TYPE_CHECKING:
 @dataclass
 class SessionState:
     confirm_edits: bool = True
+    load_cgr_instructions: bool = True
     log_file: Path | None = None
     cancelled: bool = False
+    permission_mode: PermissionMode = PermissionMode.NORMAL
+    context_tokens: int = 0
+    # Whether a rejected-API-key warning has already been emitted this
+    # session. The token counter refreshes on every turn, so without this the
+    # same unactionable-until-restart message repeats and buries the log
+    # (issue #1493).
+    token_auth_warned: bool = False
+    target_repo: Path | None = None
+    # Cumulative token consumption and USD cost across the session (issue #80).
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cost_usd: Decimal = field(default_factory=lambda: Decimal(0))
+    # Set once any turn cannot be priced, so the session total is a floor.
+    cost_incomplete: bool = False
 
     def reset_cancelled(self) -> None:
         self.cancelled = False
+
+    def is_yolo(self) -> bool:
+        return self.permission_mode == PermissionMode.YOLO
+
+    def cycle_permission_mode(self) -> PermissionMode:
+        self.permission_mode = (
+            PermissionMode.YOLO
+            if self.permission_mode == PermissionMode.NORMAL
+            else PermissionMode.NORMAL
+        )
+        return self.permission_mode
 
 
 def _default_console() -> Console:

@@ -10,7 +10,7 @@ from .utils import collect_descendants, object_body
 
 if TYPE_CHECKING:
     from ...services import IngestorProtocol
-    from ...types_defs import ASTNode
+    from ...types_defs import ASTNode, PropertyDict
 
 FIELD_BEARING_TYPES = frozenset({cs.NodeLabel.TABLE, cs.NodeLabel.TABLE_EXTENSION})
 
@@ -77,7 +77,7 @@ class AlFieldExtractor:
 
         field_qn = f"{parent_qn}{cs.SEPARATOR_DOT}{field_name}"
 
-        props: dict[str, str | int | None] = {
+        props: PropertyDict = {
             cs.KEY_QUALIFIED_NAME: field_qn,
             cs.KEY_NAME: field_name,
             "field_type": field_type,
@@ -117,7 +117,7 @@ class AlFieldExtractor:
 
         key_qn = f"{parent_qn}{cs.SEPARATOR_DOT}{key_name}"
 
-        props: dict[str, str | int | list[str]] = {
+        props: PropertyDict = {
             cs.KEY_QUALIFIED_NAME: key_qn,
             cs.KEY_NAME: key_name,
             "fields": fields,

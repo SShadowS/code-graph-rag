@@ -12,6 +12,12 @@ on:
 
 permissions: read-all
 
+# A new push to the same PR supersedes the queued or running analysis of the
+# previous head; cancelling it keeps the runner queue for live heads.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || format('{0}-{1}-{2}', github.event_name, github.sha, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   claude-review:
     name: AI Code Review
@@ -38,8 +44,8 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
-          # Optional: Specify model (defaults to Claude Sonnet 4, uncomment for Claude Opus 4.1)
-          # model: "claude-opus-4-1-20250805"
+          # Optional: Specify model (defaults to Claude Sonnet 4, uncomment for Claude Opus 4.8)
+          # model: "claude-opus-4-8"
 
           # Direct prompt for automated review (no @claude mention needed)
           direct_prompt: |
@@ -64,7 +70,7 @@ jobs:
 
             **Style:**
             - Ruff compliant (linting and formatting)
-            - No inline comments unless prefixed with (H)
+            - Comments explain why/how, not what
             - Conventional commit message format
 
             Be constructive and reference specific lines. For first-time contributors, be extra welcoming.

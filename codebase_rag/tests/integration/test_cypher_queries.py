@@ -16,6 +16,8 @@ from codebase_rag.cypher_queries import (
     build_nodes_by_ids_query,
     wrap_with_unwind,
 )
+from codebase_rag.dead_code import collect_dead_code
+from codebase_rag.types_defs import DeadCodeConfig
 
 if TYPE_CHECKING:
     from codebase_rag.services.graph_service import MemgraphIngestor
@@ -83,6 +85,26 @@ class TestBuildMergeRelationshipQueryUnit:
             "MATCH (a:Function {qualified_name: row.from_val}), "
             "(b:Function {qualified_name: row.to_val})\n"
             "MERGE (a)-[r:CALLS]->(b)\n"
+            "SET r += row.props\n"
+            "RETURN count(r) as created"
+        )
+        assert result == expected
+
+    def test_flows_to_with_merge_key_props(self) -> None:
+        result = build_merge_relationship_query(
+            "Function",
+            "qualified_name",
+            "FLOWS_TO",
+            "Function",
+            "qualified_name",
+            has_props=True,
+            merge_key_props=("via", "kind"),
+        )
+
+        expected = (
+            "MATCH (a:Function {qualified_name: row.from_val}), "
+            "(b:Function {qualified_name: row.to_val})\n"
+            "MERGE (a)-[r:FLOWS_TO {via: row.props.via, kind: row.props.kind}]->(b)\n"
             "SET r += row.props\n"
             "RETURN count(r) as created"
         )
@@ -343,6 +365,351 @@ class TestBuildMergeRelationshipQueryIntegration:
         assert verify[0]["line"] == 42
 
 
+class TestTestPathPatternsUnit:
+    def test_test_patterns_cover_js_ts_convention(self) -> None:
+        from codebase_rag.constants import TEST_PATH_PATTERNS
+
+        # *.test.ts / *.spec.tsx / __tests__/ are test files; without these
+        # substrings every symbol in them is wrongly reported as dead.
+        for path in (
+            "src/solution.test.ts",
+            "app/foo.spec.tsx",
+            "src/__tests__/helper.ts",
+        ):
+            assert any(p in path for p in TEST_PATH_PATTERNS), path
+
+
+def _dead_code_config(
+    include_tests: bool,
+    include_classes: bool = False,
+    root_decorators: tuple[str, ...] = (),
+    entry_points: tuple[str, ...] = (),
+) -> DeadCodeConfig:
+    return DeadCodeConfig(
+        include_tests=include_tests,
+        include_classes=include_classes,
+        root_decorators=frozenset(root_decorators),
+        entry_points=entry_points,
+        test_patterns=("test_", "_test", "conftest", "/tests/"),
+    )
+
+
+@pytest.mark.integration
+class TestCollectDeadCodeIntegration:
+    def _seed(self, ingestor: MemgraphIngestor) -> None:
+        # called -> live; orphan -> dead; handler is a @task root;
+        # routed is a @app.route root calling routed_callee (decorators are
+        # stored @-prefixed and dotted, exactly as the parser emits them);
+        # test_runs is a test root that calls helper (so helper is live)
+        ingestor._execute_query(
+            "CREATE "
+            "(m:Module {qualified_name: 'proj.mod', path: 'proj/mod.py'}), "
+            "(entry:Function {qualified_name: 'proj.mod.main', name: 'main', "
+            "  start_line: 1, end_line: 3, decorators: [], path: 'proj/mod.py'}), "
+            "(called:Function {qualified_name: 'proj.mod.called', name: 'called', "
+            "  start_line: 5, end_line: 7, decorators: [], path: 'proj/mod.py'}), "
+            "(orphan:Function {qualified_name: 'proj.mod.orphan', name: 'orphan', "
+            "  start_line: 9, end_line: 11, decorators: [], path: 'proj/mod.py'}), "
+            "(handler:Function {qualified_name: 'proj.mod.handler', name: 'handler', "
+            "  start_line: 13, end_line: 15, decorators: ['@task'], path: 'proj/mod.py'}), "
+            "(routed:Function {qualified_name: 'proj.mod.routed', name: 'routed', "
+            "  start_line: 21, end_line: 23, decorators: ['@app.route'], "
+            "  path: 'proj/mod.py'}), "
+            "(routed_callee:Function {qualified_name: 'proj.mod.routed_callee', "
+            "  name: 'routed_callee', start_line: 25, end_line: 27, decorators: [], "
+            "  path: 'proj/mod.py'}), "
+            "(helper:Function {qualified_name: 'proj.mod.helper', name: 'helper', "
+            "  start_line: 17, end_line: 19, decorators: [], path: 'proj/mod.py'}), "
+            "(testfn:Function {qualified_name: 'proj.tests.test_runs', "
+            "  name: 'test_runs', start_line: 1, end_line: 4, decorators: [], "
+            "  path: 'proj/tests/test_mod.py'}), "
+            "(dunder:Method {qualified_name: 'proj.mod.C.__aenter__', "
+            "  name: '__aenter__', start_line: 29, end_line: 30, decorators: [], "
+            "  path: 'proj/mod.py'}), "
+            "(entry)-[:CALLS]->(called), "
+            "(routed)-[:CALLS]->(routed_callee), "
+            "(testfn)-[:CALLS]->(helper)"
+        )
+
+    _SEED_CONFIG_ARGS = {
+        "root_decorators": ("task", "route"),
+        "entry_points": ("proj.mod.main",),
+    }
+
+    def test_reports_only_the_orphan_with_tests_included(
+        self, memgraph_ingestor: MemgraphIngestor
+    ) -> None:
+        self._seed(memgraph_ingestor)
+
+        rows = collect_dead_code(
+            memgraph_ingestor,
+            "proj",
+            _dead_code_config(include_tests=True, **self._SEED_CONFIG_ARGS),
+        )
+
+        names = {r["qualified_name"] for r in rows}
+        assert names == {"proj.mod.orphan"}
+
+    def test_excluding_tests_reports_orphan_and_test_only_code(
+        self, memgraph_ingestor: MemgraphIngestor
+    ) -> None:
+        self._seed(memgraph_ingestor)
+
+        rows = collect_dead_code(
+            memgraph_ingestor,
+            "proj",
+            _dead_code_config(include_tests=False, **self._SEED_CONFIG_ARGS),
+        )
+
+        names = {r["qualified_name"] for r in rows}
+        # without test roots, production code reached only from tests (helper)
+        # is reported; the test fn itself is test infrastructure, filtered
+        # from candidates by path.
+        assert names == {
+            "proj.mod.orphan",
+            "proj.mod.helper",
+        }
+
+    def test_returns_row_shape(self, memgraph_ingestor: MemgraphIngestor) -> None:
+        self._seed(memgraph_ingestor)
+
+        rows = collect_dead_code(
+            memgraph_ingestor,
+            "proj",
+            _dead_code_config(include_tests=True, **self._SEED_CONFIG_ARGS),
+        )
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["label"] == "Function"
+        assert row["name"] == "orphan"
+        assert row["start_line"] == 9
+        assert row["end_line"] == 11
+
+    def test_test_module_call_is_not_a_root_when_excluding_tests(
+        self, memgraph_ingestor: MemgraphIngestor
+    ) -> None:
+        # a function reached only from a TEST module's top-level call must NOT
+        # be kept alive when --no-include-tests, else test-only code hides as
+        # live. The same call DOES keep it live when tests are included.
+        memgraph_ingestor._execute_query(
+            "CREATE "
+            "(tm:Module {qualified_name: 'proj.tests.test_x', "
+            "  path: 'proj/tests/test_x.py'}), "
+            "(tool:Function {qualified_name: 'proj.mod.tool_only', "
+            "  name: 'tool_only', start_line: 1, end_line: 2, decorators: [], "
+            "  path: 'proj/mod.py'}), "
+            "(tm)-[:CALLS]->(tool)"
+        )
+
+        excluded = collect_dead_code(
+            memgraph_ingestor, "proj", _dead_code_config(include_tests=False)
+        )
+        assert {r["qualified_name"] for r in excluded} == {"proj.mod.tool_only"}
+
+        included = collect_dead_code(
+            memgraph_ingestor, "proj", _dead_code_config(include_tests=True)
+        )
+        assert {r["qualified_name"] for r in included} == set()
+
+    def test_class_candidates_when_classes_included(
+        self, memgraph_ingestor: MemgraphIngestor
+    ) -> None:
+        # used is a module-load root that instantiates WithInit (INSTANTIATES
+        # the class plus CALLS its __init__), NoInit (INSTANTIATES only, no
+        # __init__) and Derived (INSTANTIATES; Derived INHERITS Base, so Base
+        # is live too). Only DeadClass (and the orphan function) is unreachable.
+        memgraph_ingestor._execute_query(
+            "CREATE "
+            "(m:Module {qualified_name: 'proj.mod', path: 'proj/mod.py'}), "
+            "(used:Function {qualified_name: 'proj.mod.used', name: 'used', "
+            "  start_line: 1, end_line: 2, decorators: [], path: 'proj/mod.py'}), "
+            "(orphan_fn:Function {qualified_name: 'proj.mod.orphan_fn', "
+            "  name: 'orphan_fn', start_line: 4, end_line: 5, decorators: [], "
+            "  path: 'proj/mod.py'}), "
+            "(wi:Class {qualified_name: 'proj.mod.WithInit', name: 'WithInit', "
+            "  start_line: 7, end_line: 9, decorators: [], path: 'proj/mod.py'}), "
+            "(wii:Method {qualified_name: 'proj.mod.WithInit.__init__', "
+            "  name: '__init__', start_line: 8, end_line: 9, decorators: [], "
+            "  path: 'proj/mod.py'}), "
+            "(ni:Class {qualified_name: 'proj.mod.NoInit', name: 'NoInit', "
+            "  start_line: 11, end_line: 12, decorators: [], path: 'proj/mod.py'}), "
+            "(base:Class {qualified_name: 'proj.mod.Base', name: 'Base', "
+            "  start_line: 14, end_line: 15, decorators: [], path: 'proj/mod.py'}), "
+            "(der:Class {qualified_name: 'proj.mod.Derived', name: 'Derived', "
+            "  start_line: 17, end_line: 18, decorators: [], path: 'proj/mod.py'}), "
+            "(dead:Class {qualified_name: 'proj.mod.DeadClass', name: 'DeadClass', "
+            "  start_line: 20, end_line: 21, decorators: [], path: 'proj/mod.py'}), "
+            "(wi)-[:DEFINES_METHOD]->(wii), "
+            "(der)-[:INHERITS]->(base), "
+            "(m)-[:CALLS]->(used), "
+            "(used)-[:INSTANTIATES]->(wi), "
+            "(used)-[:CALLS]->(wii), "
+            "(used)-[:INSTANTIATES]->(ni), "
+            "(used)-[:INSTANTIATES]->(der)"
+        )
+
+        without_classes = collect_dead_code(
+            memgraph_ingestor,
+            "proj",
+            _dead_code_config(include_tests=False, include_classes=False),
+        )
+        assert {r["qualified_name"] for r in without_classes} == {"proj.mod.orphan_fn"}
+
+        with_classes = collect_dead_code(
+            memgraph_ingestor,
+            "proj",
+            _dead_code_config(include_tests=False, include_classes=True),
+        )
+        assert {r["qualified_name"] for r in with_classes} == {
+            "proj.mod.orphan_fn",
+            "proj.mod.DeadClass",
+        }
+
+    def test_subclass_only_base_is_reported_when_subclass_is_unreachable(
+        self, memgraph_ingestor: MemgraphIngestor
+    ) -> None:
+        # Base is subclassed by Derived, but nothing instantiates Derived, so
+        # the traversal never reaches Derived and therefore never reaches Base
+        # via INHERITS. The whole dead cluster (both classes) is reported: a
+        # base kept alive only by an unreachable subclass is itself dead.
+        # Live is present purely so the scan has a reachable root to anchor.
+        memgraph_ingestor._execute_query(
+            "CREATE "
+            "(m:Module {qualified_name: 'proj.mod', path: 'proj/mod.py'}), "
+            "(live:Class {qualified_name: 'proj.mod.Live', name: 'Live', "
+            "  start_line: 1, end_line: 2, decorators: [], path: 'proj/mod.py'}), "
+            "(base:Class {qualified_name: 'proj.mod.Base', name: 'Base', "
+            "  start_line: 4, end_line: 5, decorators: [], path: 'proj/mod.py'}), "
+            "(der:Class {qualified_name: 'proj.mod.Derived', name: 'Derived', "
+            "  start_line: 7, end_line: 8, decorators: [], path: 'proj/mod.py'}), "
+            "(der)-[:INHERITS]->(base), "
+            "(m)-[:INSTANTIATES]->(live)"
+        )
+
+        with_classes = collect_dead_code(
+            memgraph_ingestor,
+            "proj",
+            _dead_code_config(include_tests=False, include_classes=True),
+        )
+        assert {r["qualified_name"] for r in with_classes} == {
+            "proj.mod.Base",
+            "proj.mod.Derived",
+        }
+
+    def test_no_roots_reports_everything(
+        self, memgraph_ingestor: MemgraphIngestor
+    ) -> None:
+        # with no roots at all (nothing exported / entry-point / decorated /
+        # called at module load), every function is unreachable and reported.
+        memgraph_ingestor._execute_query(
+            "CREATE "
+            "(a:Function {qualified_name: 'proj.mod.a', name: 'a', start_line: 1, "
+            "  end_line: 2, decorators: [], is_exported: false, path: 'proj/mod.py'}), "
+            "(b:Function {qualified_name: 'proj.mod.b', name: 'b', start_line: 4, "
+            "  end_line: 5, decorators: [], is_exported: false, path: 'proj/mod.py'}), "
+            "(a)-[:CALLS]->(b)"
+        )
+
+        rows = collect_dead_code(
+            memgraph_ingestor, "proj", _dead_code_config(include_tests=False)
+        )
+        assert {r["qualified_name"] for r in rows} == {
+            "proj.mod.a",
+            "proj.mod.b",
+        }
+
+    def test_registration_closure_and_protocol_stub_are_roots(
+        self, memgraph_ingestor: MemgraphIngestor
+    ) -> None:
+        # a decorated closure DEFINED by a LIVE function (prompt_toolkit
+        # @bindings.add, MCP @server.list_tools) is registered when its enclosing
+        # function runs and keeps its own callees live; a typing.Protocol subclass
+        # method is an interface stub whose callers resolve to the implementations.
+        # Neither is dead, while an undecorated closure, a plain private method, and
+        # the whole cluster under a DEAD enclosing function are.
+        memgraph_ingestor._execute_query(
+            "CREATE "
+            "(m:Module {qualified_name: 'proj.mod', path: 'proj/mod.py'}), "
+            "(outer:Function {qualified_name: 'proj.mod.outer', name: 'outer', "
+            "  start_line: 1, end_line: 8, decorators: [], path: 'proj/mod.py'}), "
+            "(submit:Function {qualified_name: 'proj.mod.outer._submit', "
+            "  name: '_submit', start_line: 2, end_line: 3, "
+            "  decorators: ['@bindings.add(\"c-j\")'], path: 'proj/mod.py'}), "
+            "(unused:Function {qualified_name: 'proj.mod.outer._unused', "
+            "  name: '_unused', start_line: 5, end_line: 6, decorators: [], "
+            "  path: 'proj/mod.py'}), "
+            "(proto:Class {qualified_name: 'typing.Protocol', name: 'Protocol'}), "
+            "(loadable:Class {qualified_name: 'proj.mod.Loadable', "
+            "  name: 'Loadable', path: 'proj/mod.py'}), "
+            "(stub:Method {qualified_name: 'proj.mod.Loadable._ensure_loaded', "
+            "  name: '_ensure_loaded', start_line: 10, end_line: 10, "
+            "  decorators: [], path: 'proj/mod.py'}), "
+            "(plain:Class {qualified_name: 'proj.mod.Plain', name: 'Plain', "
+            "  path: 'proj/mod.py'}), "
+            "(helper:Method {qualified_name: 'proj.mod.Plain._helper', "
+            "  name: '_helper', start_line: 12, end_line: 13, decorators: [], "
+            "  path: 'proj/mod.py'}), "
+            "(live_callee:Function {qualified_name: 'proj.mod._only_from_closure', "
+            "  name: '_only_from_closure', start_line: 15, end_line: 16, "
+            "  decorators: [], path: 'proj/mod.py'}), "
+            "(dead_outer:Function {qualified_name: 'proj.mod.dead_outer', "
+            "  name: 'dead_outer', start_line: 18, end_line: 24, decorators: [], "
+            "  path: 'proj/mod.py'}), "
+            "(ghost:Function {qualified_name: 'proj.mod.dead_outer._ghost', "
+            "  name: '_ghost', start_line: 19, end_line: 20, "
+            "  decorators: ['@bindings.add(\"c-x\")'], path: 'proj/mod.py'}), "
+            "(victim:Function {qualified_name: 'proj.mod.victim', name: 'victim', "
+            "  start_line: 26, end_line: 27, decorators: [], path: 'proj/mod.py'}), "
+            "(m)-[:CALLS]->(outer), "
+            "(outer)-[:DEFINES]->(submit), "
+            "(outer)-[:DEFINES]->(unused), "
+            "(submit)-[:CALLS]->(live_callee), "
+            "(dead_outer)-[:DEFINES]->(ghost), "
+            "(ghost)-[:CALLS]->(victim), "
+            "(loadable)-[:INHERITS]->(proto), "
+            "(loadable)-[:DEFINES_METHOD]->(stub), "
+            "(plain)-[:DEFINES_METHOD]->(helper)"
+        )
+
+        rows = collect_dead_code(
+            memgraph_ingestor, "proj", _dead_code_config(include_tests=False)
+        )
+        assert {r["qualified_name"] for r in rows} == {
+            "proj.mod.outer._unused",
+            "proj.mod.Plain._helper",
+            "proj.mod.dead_outer",
+            "proj.mod.dead_outer._ghost",
+            "proj.mod.victim",
+        }
+
+    def test_module_load_callee_is_a_root(
+        self, memgraph_ingestor: MemgraphIngestor
+    ) -> None:
+        # a function called by a Module (e.g. `if __name__ == "__main__": main()`
+        # or a bare decorator) runs at import, so it and its callees are live even
+        # with no entry-point/decorator/export root.
+        memgraph_ingestor._execute_query(
+            "CREATE "
+            "(m:Module {qualified_name: 'proj.mod', path: 'proj/mod.py'}), "
+            "(main:Function {qualified_name: 'proj.mod.main', name: 'main', "
+            "  start_line: 1, end_line: 2, decorators: [], path: 'proj/mod.py'}), "
+            "(used:Function {qualified_name: 'proj.mod.used', name: 'used', "
+            "  start_line: 4, end_line: 5, decorators: [], path: 'proj/mod.py'}), "
+            "(orphan:Function {qualified_name: 'proj.mod.orphan', name: 'orphan', "
+            "  start_line: 7, end_line: 8, decorators: [], path: 'proj/mod.py'}), "
+            "(m)-[:CALLS]->(main), "
+            "(main)-[:CALLS]->(used)"
+        )
+
+        rows = collect_dead_code(
+            memgraph_ingestor, "proj", _dead_code_config(include_tests=False)
+        )
+        names = {r["qualified_name"] for r in rows}
+
+        assert names == {"proj.mod.orphan"}
+
+
 @pytest.mark.integration
 class TestBuildNodesByIdsQueryIntegration:
     def test_fetches_nodes_by_ids(self, memgraph_ingestor: MemgraphIngestor) -> None:
@@ -376,3 +743,70 @@ class TestBuildNodesByIdsQueryIntegration:
         results = memgraph_ingestor._execute_query(query, params)
 
         assert len(results) == 0
+
+
+@pytest.mark.integration
+class TestFlowsToParallelProvenanceIntegration:
+    """#722: multiple tainted args to the same callee must keep one FLOWS_TO
+    edge per `via`, not collapse into a single edge under MERGE."""
+
+    def test_parallel_via_edges_survive_merge(
+        self, memgraph_ingestor: MemgraphIngestor
+    ) -> None:
+        memgraph_ingestor._execute_query(
+            "CREATE (a:Function {qualified_name: 'mod.caller', name: 'caller'}), "
+            "(b:Function {qualified_name: 'mod.callee', name: 'callee'})"
+        )
+
+        for via in ("kw:username", "kw:password"):
+            memgraph_ingestor.ensure_relationship_batch(
+                ("Function", "qualified_name", "mod.caller"),
+                "FLOWS_TO",
+                ("Function", "qualified_name", "mod.callee"),
+                properties={"via": via, "kind": "arg"},
+            )
+        memgraph_ingestor.flush_all()
+
+        rows = memgraph_ingestor._execute_query(
+            "MATCH (:Function {qualified_name: 'mod.caller'})"
+            "-[r:FLOWS_TO]->(:Function {qualified_name: 'mod.callee'}) "
+            "RETURN r.via as via ORDER BY via"
+        )
+
+        assert [r["via"] for r in rows] == ["kw:password", "kw:username"]
+
+    def test_mixed_via_and_viales_edges_do_not_collapse(
+        self, memgraph_ingestor: MemgraphIngestor
+    ) -> None:
+        # A batch mixing rows that carry `via` with a row that does not (same
+        # endpoints) must keep every edge: the via-less row must not strip
+        # `via` from the merge key for the rest (#722 mixed-batch regression).
+        memgraph_ingestor._execute_query(
+            "CREATE (a:Function {qualified_name: 'mod.caller', name: 'caller'}), "
+            "(b:Function {qualified_name: 'mod.callee', name: 'callee'})"
+        )
+
+        for props in (
+            {"via": "kw:username", "kind": "arg"},
+            {"via": "kw:password", "kind": "arg"},
+            {"kind": "return"},
+        ):
+            memgraph_ingestor.ensure_relationship_batch(
+                ("Function", "qualified_name", "mod.caller"),
+                "FLOWS_TO",
+                ("Function", "qualified_name", "mod.callee"),
+                properties=props,
+            )
+        memgraph_ingestor.flush_all()
+
+        rows = memgraph_ingestor._execute_query(
+            "MATCH (:Function {qualified_name: 'mod.caller'})"
+            "-[r:FLOWS_TO]->(:Function {qualified_name: 'mod.callee'}) "
+            "RETURN r.via as via, r.kind as kind ORDER BY r.kind, r.via"
+        )
+
+        assert [(r["via"], r["kind"]) for r in rows] == [
+            ("kw:password", "arg"),
+            ("kw:username", "arg"),
+            (None, "return"),
+        ]

@@ -16,14 +16,157 @@ if TYPE_CHECKING:
     from ..import_processor import ImportProcessor
 
 
+def php_base_simple_name(node: Node) -> str | None:
+    # A PHP base type is a plain `name` (`Base`) or a `qualified_name`
+    # (`\Exception`, `\App\Base`) whose trailing `name` child is the simple
+    # name; cgr resolves bases by simple name.
+    if node.type == cs.TS_PHP_NAME and node.text:
+        return safe_decode_text(node)
+    if node.type == cs.TS_PHP_QUALIFIED_NAME:
+        last: Node | None = None
+        for child in node.children:
+            if child.type == cs.TS_PHP_NAME:
+                last = child
+        return safe_decode_text(last) if last and last.text else None
+    return None
+
+
+def _csharp_base_written_name(node: Node) -> str | None:
+    # The written base name for resolution: bare identifier, a generic base
+    # stripped to its identifier (`List<int>` -> `List`), a dotted
+    # qualified_name (`System.Exception`), or a record positional base
+    # unwrapped to its type. predefined_type (an enum's underlying type) and
+    # punctuation (`:`, `,`) yield None so they are dropped.
+    match node.type:
+        case cs.TS_CSHARP_IDENTIFIER:
+            return safe_decode_text(node) if node.text else None
+        case cs.TS_CSHARP_GENERIC_NAME:
+            ident = find_child_by_type(node, cs.TS_CSHARP_IDENTIFIER)
+            return safe_decode_text(ident) if ident and ident.text else None
+        case cs.TS_CSHARP_QUALIFIED_NAME:
+            return _csharp_qualified_base_name(node)
+        case cs.TS_CSHARP_PRIMARY_CONSTRUCTOR_BASE_TYPE:
+            return next(
+                (
+                    name
+                    for child in node.children
+                    if (name := _csharp_base_written_name(child))
+                ),
+                None,
+            )
+    return None
+
+
+def _csharp_qualified_base_name(node: Node) -> str | None:
+    # A qualified generic base (`System.Collections.Generic.List<int>`)
+    # is one qualified_name whose text carries the type arguments; strip
+    # them so the written name matches the registered, generic-free qn.
+    # Every argument span goes, not the tail from the first `<`: a nested
+    # type of a generic outer (`Outer<int>.Inner`) keeps its `.Inner`
+    # (CodeRabbit, #1770).
+    if not node.text:
+        return None
+    text = safe_decode_text(node)
+    return _strip_type_arguments(text) if text else None
+
+
+def _strip_type_arguments(text: str) -> str:
+    """`Outer<int>.Inner<Map<K, V>>` -> `Outer.Inner`: drop every balanced
+    angle-bracket span, however deep."""
+    kept: list[str] = []
+    depth = 0
+    for char in text:
+        if char == cs.CHAR_ANGLE_OPEN:
+            depth += 1
+        elif char == cs.CHAR_ANGLE_CLOSE:
+            depth = max(depth - 1, 0)
+        elif depth == 0:
+            kept.append(char)
+    return "".join(kept)
+
+
+def _csharp_looks_like_interface(simple_name: str) -> bool:
+    # The C# `I`-prefix convention (IShape, IDisposable) is the fallback signal
+    # when the Roslyn frontend is off: at parse time it is the only way to tell
+    # an interface from the base class inside one base_list. The opt-in Roslyn
+    # hybrid frontend (issue #738) supplies the exact class-vs-interface answer.
+    return len(simple_name) >= 2 and simple_name[0] == "I" and simple_name[1].isupper()
+
+
+# Roslyn base-kind values (see csharp_frontend.frontend): the semantic model
+# classifies each base as one of these; "unknown" (unresolved symbol) defers
+# to the I-prefix heuristic.
+_CSHARP_BASE_KIND_CLASS = "class"
+_CSHARP_BASE_KIND_INTERFACE = "interface"
+
+
+def split_csharp_bases(
+    class_node: Node,
+    module_qn: str,
+    resolve_to_qn: Callable[[str, str], str],
+    base_kinds: dict[str, str] | None = None,
+) -> tuple[list[str], list[str]]:
+    # Return (inherited_qns, implemented_qns). C# folds the base class and all
+    # interfaces into one base_list; the base class, if any, is the FIRST entry
+    # (grammar-enforced) and must not look like an interface. An interface's
+    # bases are all inheritance; a struct/record/class implements the rest.
+    # `base_kinds` (from the Roslyn frontend) maps a base's simple name to its
+    # exact kind; when present it overrides the I-prefix heuristic per base.
+    if class_node.type == cs.TS_CSHARP_ENUM_DECLARATION:
+        return [], []
+    base_list = find_child_by_type(class_node, cs.TS_CSHARP_BASE_LIST)
+    if base_list is None:
+        return [], []
+
+    written = [
+        name
+        for child in base_list.children
+        if (name := _csharp_base_written_name(child))
+    ]
+    is_interface = class_node.type == cs.TS_CSHARP_INTERFACE_DECLARATION
+    is_struct = class_node.type == cs.TS_CSHARP_STRUCT_DECLARATION
+
+    inherited: list[str] = []
+    implemented: list[str] = []
+    for index, name in enumerate(written):
+        resolved = resolve_to_qn(name, module_qn)
+        simple = name.rsplit(cs.SEPARATOR_DOT, 1)[-1]
+        # An interface's own bases are all INHERITS in cgr's model (interface
+        # extends interface), independent of the semantic kind.
+        if is_interface:
+            inherited.append(resolved)
+            continue
+        kind = base_kinds.get(simple) if base_kinds else None
+        if kind == _CSHARP_BASE_KIND_INTERFACE:
+            implemented.append(resolved)
+        elif kind == _CSHARP_BASE_KIND_CLASS:
+            inherited.append(resolved)
+        elif index == 0 and not is_struct and not _csharp_looks_like_interface(simple):
+            inherited.append(resolved)
+        else:
+            implemented.append(resolved)
+    return inherited, implemented
+
+
 def extract_parent_classes(
     class_node: Node,
     module_qn: str,
     import_processor: ImportProcessor,
     resolve_to_qn: Callable[[str, str], str],
+    csharp_base_kinds: dict[str, str] | None = None,
 ) -> list[str]:
     if class_node.type in cs.CPP_CLASS_TYPES:
         return extract_cpp_parent_classes(class_node, module_qn)
+
+    # C# base_list (unique to C#): the base class, or an interface's base
+    # interfaces, are INHERITS; the implemented interfaces are handled by
+    # extract_implemented_interfaces. Return early so the Java/TS clause
+    # walks below never touch a C# node (class_declaration is shared).
+    if find_child_by_type(class_node, cs.TS_CSHARP_BASE_LIST) is not None:
+        inherited, _ = split_csharp_bases(
+            class_node, module_qn, resolve_to_qn, csharp_base_kinds
+        )
+        return inherited
 
     parent_classes: list[str] = []
 
@@ -52,21 +195,231 @@ def extract_parent_classes(
             )
         )
 
+    # PHP `extends` (a class's superclass or an interface's superinterfaces)
+    # is a base_clause listing `name` nodes; both are inheritance.
+    if base_clause := find_child_by_type(class_node, cs.TS_PHP_BASE_CLAUSE):
+        for child in base_clause.children:
+            if parent_name := php_base_simple_name(child):
+                parent_classes.append(resolve_to_qn(parent_name, module_qn))
+
+    # Rust supertrait bound (`trait Sub: Super`) is inheritance between traits.
+    if class_node.type == cs.TS_RS_TRAIT_ITEM:
+        if bounds := class_node.child_by_field_name(cs.FIELD_BOUNDS):
+            for child in bounds.children:
+                base = java_base_type_identifier(child)
+                if base is not None and base.text:
+                    if name := safe_decode_text(base):
+                        parent_classes.append(resolve_to_qn(name, module_qn))
+
+    if class_node.type in (
+        cs.TS_DART_CLASS_DEFINITION,
+        cs.TS_DART_MIXIN_DECLARATION,
+    ):
+        parent_classes.extend(
+            extract_dart_parent_classes(class_node, module_qn, resolve_to_qn)
+        )
+
+    if class_node.type in cs.SPEC_SCALA_CLASS_TYPES:
+        parent_classes.extend(
+            extract_scala_parent_classes(class_node, module_qn, resolve_to_qn)
+        )
+
     return parent_classes
+
+
+# Only these wrappers are descended; see the constants module for why
+# `type_arguments` must not be.
+_SCALA_BASE_WRAPPERS = (
+    cs.TS_SCALA_GENERIC_TYPE,
+    cs.TS_SCALA_STABLE_TYPE_IDENTIFIER,
+)
+
+
+def _scala_base_type_identifier(node: Node) -> Node | None:
+    """The `type_identifier` naming a Scala base, at whatever depth it sits.
+
+    Descends the LAST type-bearing child at each level, which is what picks
+    the simple name out of `foo.bar.Baz`: the qualifier segments come first
+    and the type name is last. Bounded to the wrapper kinds the grammar
+    actually produces, so this never walks into a type argument list and
+    returns `Int` from `foo.Service[Int]`.
+    """
+    if node.type == cs.TS_TYPE_IDENTIFIER:
+        return node
+    if node.type not in _SCALA_BASE_WRAPPERS:
+        return None
+    for child in reversed(node.children):
+        if found := _scala_base_type_identifier(child):
+            return found
+    return None
+
+
+def _scala_base_written_name(node: Node) -> str | None:
+    """The base as WRITTEN, qualifier included, with type arguments stripped.
+
+    `foo.Service[Int]` yields `foo.Service`, not `Service`. Returning the
+    terminal identifier alone discards the qualifier, so a class extending an
+    external `foo.Service` resolves to whatever same-named class is in scope
+    -- a WRONG edge rather than a missing one, which is the more damaging
+    failure because the graph gains a relationship the source never expressed.
+
+    Matches how C# handles the same shape (`_csharp_base_written_name`): pass
+    the full dotted name to the resolver and let it decide, rather than
+    pre-truncating to a simple name the resolver cannot disambiguate.
+    """
+    if node.type == cs.TS_SCALA_STABLE_TYPE_IDENTIFIER and node.text:
+        return safe_decode_text(node)
+    if node.type == cs.TS_SCALA_GENERIC_TYPE:
+        # `foo.Service[Int]` / `Service[Int]`: the first child is the type,
+        # the type_arguments sibling is what must not be included.
+        for child in node.children:
+            if child.type in (
+                cs.TS_SCALA_STABLE_TYPE_IDENTIFIER,
+                cs.TS_TYPE_IDENTIFIER,
+            ):
+                return safe_decode_text(child) if child.text else None
+        return None
+    if node.type == cs.TS_TYPE_IDENTIFIER and node.text:
+        return safe_decode_text(node)
+    return None
+
+
+def extract_scala_parent_classes(
+    class_node: Node,
+    module_qn: str,
+    resolve_to_qn: Callable[[str, str], str],
+) -> list[str]:
+    """Bases from a Scala `extends A with B with C` clause.
+
+    Every base is taken, not just the one after `extends`. Scala composes
+    behaviour by mixing traits in with `with`, so reading the first base only
+    would capture the superclass and silently drop the mixins -- which is most
+    of the structure in idiomatic Scala, and the linearization #1186 asks to
+    record.
+
+    `extends` and `with` are anonymous keyword children of the same
+    `extends_clause`, so the type nodes are collected by kind rather than by
+    position: no keyword marks where the base list stops.
+
+    The grammar nests the four base spellings to different depths, so the
+    `type_identifier` is found by descending rather than at a fixed level:
+
+        Named                -> type_identifier
+        Seq[Int]             -> generic_type > type_identifier
+        foo.Bar              -> stable_type_identifier > type_identifier
+        foo.Seq[Int]         -> generic_type > stable_type_identifier > type_identifier
+
+    A fixed one-level lookup finds the first three and drops the fourth, which
+    is the combination real Scala uses most (`extends akka.actor.Actor[T]`).
+    Dropping a base is invisible in the graph: the class still exists, it just
+    floats free of its parent.
+    """
+    extends_clause = find_child_by_type(class_node, cs.TS_EXTENDS_CLAUSE)
+    if extends_clause is None:
+        return []
+
+    parents: list[str] = []
+    for child in extends_clause.children:
+        if name := _scala_base_written_name(child):
+            parents.append(resolve_to_qn(name, module_qn))
+    return parents
+
+
+def extract_dart_parent_classes(
+    class_node: Node,
+    module_qn: str,
+    resolve_to_qn: Callable[[str, str], str],
+) -> list[str]:
+    # Dart inheritance is INHERITS: the `superclass` node's first
+    # type_identifier is the `extends` base, its nested `mixins` node holds
+    # the `with` types (a mixin contributes members like a base), and a
+    # `mixin M on Base` states a required superclass as a bare type_identifier
+    # child. `implements` targets are IMPLEMENTS (extract_implemented_interfaces).
+    parents: list[str] = []
+    if superclass := find_child_by_type(class_node, cs.TS_DART_SUPERCLASS):
+        for child in superclass.named_children:
+            if child.type == cs.TS_DART_TYPE_IDENTIFIER and (
+                name := safe_decode_text(child)
+            ):
+                parents.append(resolve_to_qn(name, module_qn))
+            elif child.type == cs.TS_DART_MIXINS:
+                for mixin in child.named_children:
+                    if mixin.type == cs.TS_DART_TYPE_IDENTIFIER and (
+                        mixin_name := safe_decode_text(mixin)
+                    ):
+                        parents.append(resolve_to_qn(mixin_name, module_qn))
+    if class_node.type == cs.TS_DART_MIXIN_DECLARATION:
+        for child in class_node.named_children:
+            if child.type == cs.TS_DART_TYPE_IDENTIFIER and (
+                on_name := safe_decode_text(child)
+            ):
+                parents.append(resolve_to_qn(on_name, module_qn))
+    return parents
+
+
+def extract_dart_extends_type_args(
+    class_node: Node,
+    module_qn: str,
+    resolve_to_qn: Callable[[str, str], str],
+) -> list[str]:
+    # `extends Base<T, U>`: the clause's type arguments resolved to qns, so
+    # a member call on an undeclared receiver inside the subclass can bind
+    # against the first-party types an EXTERNAL generic base hands back
+    # (`State<GridBtn>.widget` is a GridBtn, issue #875). The type_arguments
+    # child of `superclass` belongs to the extends base; a mixin's own
+    # arguments nest under `mixins` and are not collected.
+    superclass = find_child_by_type(class_node, cs.TS_DART_SUPERCLASS)
+    if superclass is None:
+        return []
+    type_args = find_child_by_type(superclass, cs.TS_DART_TYPE_ARGUMENTS)
+    if type_args is None:
+        return []
+    # An import-prefixed argument (`State<models.GridBtn>`) is two FLAT
+    # sibling type_identifiers, distinguishable from a two-argument list
+    # (`Pair<A, B>`) only by the joining `.` token, so walk ALL children
+    # and glue dot-joined runs into one dotted name. A nested generic's own
+    # arguments (`List<T>`) and nullable markers carry no bindable
+    # first-party identity and are skipped.
+    names: list[str] = []
+    parts: list[str] = []
+    pending_dot = False
+    for child in type_args.children:
+        if child.type == cs.TS_DART_TYPE_IDENTIFIER:
+            if parts and not pending_dot:
+                names.append(cs.SEPARATOR_DOT.join(parts))
+                parts = []
+            if name := safe_decode_text(child):
+                parts.append(name)
+            pending_dot = False
+        elif child.type == cs.SEPARATOR_DOT:
+            pending_dot = True
+    if parts:
+        names.append(cs.SEPARATOR_DOT.join(parts))
+    return [resolve_to_qn(name, module_qn) for name in names]
 
 
 def extract_cpp_parent_classes(class_node: Node, module_qn: str) -> list[str]:
-    parent_classes: list[str] = []
+    return [guess for _, guess in extract_cpp_parent_bases(class_node, module_qn)]
+
+
+def extract_cpp_parent_bases(class_node: Node, module_qn: str) -> list[tuple[str, str]]:
+    """Return (written base name, parse-time guess qn) per base, in source order.
+
+    The written name keeps its ``::`` qualifiers (template arguments stripped)
+    so deferred resolution can scope-match it across files; the guess anchors
+    the base to the class's own module and only holds for same-file bases.
+    """
+    bases: list[tuple[str, str]] = []
     for child in class_node.children:
         if child.type == cs.TS_BASE_CLASS_CLAUSE:
-            parent_classes.extend(parse_cpp_base_classes(child, class_node, module_qn))
-    return parent_classes
+            bases.extend(parse_cpp_base_classes(child, class_node, module_qn))
+    return bases
 
 
 def parse_cpp_base_classes(
     base_clause_node: Node, class_node: Node, module_qn: str
-) -> list[str]:
-    parent_classes: list[str] = []
+) -> list[tuple[str, str]]:
+    bases: list[tuple[str, str]] = []
     base_type_nodes = (
         cs.TS_TYPE_IDENTIFIER,
         cs.CppNodeType.QUALIFIED_IDENTIFIER,
@@ -84,28 +437,56 @@ def parse_cpp_base_classes(
 
         if base_child.type in base_type_nodes and base_child.text:
             if parent_name := safe_decode_text(base_child):
+                # strip(): `public Base <T>` would otherwise keep a
+                # trailing space that can never match the registry.
+                written_name = parent_name.split(cs.CHAR_ANGLE_OPEN)[0].strip()
                 base_name = extract_cpp_base_class_name(parent_name)
                 parent_qn = cpp_utils.build_qualified_name(
                     class_node, module_qn, base_name
                 )
-                parent_classes.append(parent_qn)
+                bases.append((written_name, parent_qn))
                 logger.debug(
                     logs.CLASS_CPP_INHERITANCE,
                     parent_name=parent_name,
                     parent_qn=parent_qn,
                 )
 
-    return parent_classes
+    return bases
 
 
 def extract_cpp_base_class_name(parent_text: str) -> str:
     if cs.CHAR_ANGLE_OPEN in parent_text:
-        parent_text = parent_text.split(cs.CHAR_ANGLE_OPEN)[0]
+        parent_text = parent_text.split(cs.CHAR_ANGLE_OPEN, maxsplit=1)[0]
 
     if cs.SEPARATOR_DOUBLE_COLON in parent_text:
         parent_text = parent_text.split(cs.SEPARATOR_DOUBLE_COLON)[-1]
 
-    return parent_text
+    # `public Base <T>` leaves a trailing space after the angle split.
+    return parent_text.strip()
+
+
+def java_base_type_identifier(type_node: Node) -> Node | None:
+    # The base type in a Java extends/implements clause may be plain
+    # (`Base`), generic (`Base<T>` -> generic_type), or qualified
+    # (`pkg.Base` -> scoped_type_identifier). Unwrap to the base type's
+    # type_identifier so generic/qualified bases are captured, not dropped.
+    if type_node.type == cs.TS_TYPE_IDENTIFIER:
+        return type_node
+    if type_node.type == cs.TS_GENERIC_TYPE:
+        for child in type_node.children:
+            if child.type in (
+                cs.TS_TYPE_IDENTIFIER,
+                cs.TS_RS_SCOPED_TYPE_IDENTIFIER,
+            ):
+                return java_base_type_identifier(child)
+    if type_node.type == cs.TS_RS_SCOPED_TYPE_IDENTIFIER:
+        # `a.b.Base` -> the trailing type_identifier is the simple name.
+        last: Node | None = None
+        for child in type_node.children:
+            if child.type == cs.TS_TYPE_IDENTIFIER:
+                last = child
+        return last
+    return None
 
 
 def resolve_superclass_from_type_identifier(
@@ -113,8 +494,9 @@ def resolve_superclass_from_type_identifier(
     module_qn: str,
     resolve_to_qn: Callable[[str, str], str],
 ) -> str | None:
-    if type_identifier_node.text:
-        if parent_name := safe_decode_text(type_identifier_node):
+    base = java_base_type_identifier(type_identifier_node)
+    if base is not None and base.text:
+        if parent_name := safe_decode_text(base):
             return resolve_to_qn(parent_name, module_qn)
     return None
 
@@ -128,7 +510,12 @@ def extract_java_superclass(
     if not superclass_node:
         return []
 
-    if superclass_node.type == cs.TS_TYPE_IDENTIFIER:
+    _JAVA_BASE_TYPES = (
+        cs.TS_TYPE_IDENTIFIER,
+        cs.TS_GENERIC_TYPE,
+        cs.TS_RS_SCOPED_TYPE_IDENTIFIER,
+    )
+    if superclass_node.type in _JAVA_BASE_TYPES:
         if resolved := resolve_superclass_from_type_identifier(
             superclass_node, module_qn, resolve_to_qn
         ):
@@ -136,7 +523,7 @@ def extract_java_superclass(
         return []
 
     for child in superclass_node.children:
-        if child.type == cs.TS_TYPE_IDENTIFIER:
+        if child.type in _JAVA_BASE_TYPES:
             if resolved := resolve_superclass_from_type_identifier(
                 child, module_qn, resolve_to_qn
             ):
@@ -158,17 +545,30 @@ def extract_python_superclasses(
     import_map = import_processor.import_mapping.get(module_qn)
 
     for child in superclasses_node.children:
-        if child.type != cs.TS_IDENTIFIER or not child.text:
+        # A SUBSCRIPTED generic base (`class IntRange(_NumberRangeBase[int,
+        # int])`, click) is a `subscript` node; the base name is its `value`
+        # field. Skipping it dropped the INHERITS edge and with it every
+        # OVERRIDES/dispatch relationship of the subclass.
+        if child.type == cs.TS_PY_SUBSCRIPT:
+            value = child.child_by_field_name(cs.FIELD_VALUE)
+            if value is not None and value.type in (
+                cs.TS_IDENTIFIER,
+                cs.TS_PY_ATTRIBUTE,
+            ):
+                child = value
+        if child.type not in (cs.TS_IDENTIFIER, cs.TS_PY_ATTRIBUTE) or not child.text:
             continue
         if not (parent_name := safe_decode_text(child)):
             continue
 
-        if import_map and parent_name in import_map:
-            parent_classes.append(import_map[parent_name])
+        head, sep, tail = parent_name.partition(cs.SEPARATOR_DOT)
+        if import_map and head in import_map:
+            resolved_head = import_map[head]
         elif import_map:
-            parent_classes.append(resolve_to_qn(parent_name, module_qn))
+            resolved_head = resolve_to_qn(head, module_qn)
         else:
-            parent_classes.append(f"{module_qn}.{parent_name}")
+            resolved_head = f"{module_qn}.{head}"
+        parent_classes.append(f"{resolved_head}{sep}{tail}")
 
     return parent_classes
 
@@ -238,6 +638,13 @@ def extract_interface_parents(
     import_processor: ImportProcessor,
     resolve_to_qn: Callable[[str, str], str],
 ) -> list[str]:
+    # Java interface `extends A, B` is an `extends_interfaces` clause holding a
+    # type_list; superinterfaces are inheritance, so emit them as INHERITS.
+    if java_extends := find_child_by_type(class_node, cs.TS_JAVA_EXTENDS_INTERFACES):
+        parents: list[str] = []
+        extract_java_interface_names(java_extends, parents, module_qn, resolve_to_qn)
+        return parents
+
     extends_clause = find_child_by_type(class_node, cs.TS_EXTENDS_TYPE_CLAUSE)
     if not extends_clause:
         return []
@@ -301,7 +708,17 @@ def extract_implemented_interfaces(
     class_node: Node,
     module_qn: str,
     resolve_to_qn: Callable[[str, str], str],
+    csharp_base_kinds: dict[str, str] | None = None,
 ) -> list[str]:
+    # C# implemented interfaces come from the shared base_list (the base
+    # class, if any, is stripped by split_csharp_bases). Return early so the
+    # Java/TS/PHP clause walks never run on a C# node.
+    if find_child_by_type(class_node, cs.TS_CSHARP_BASE_LIST) is not None:
+        _, implemented = split_csharp_bases(
+            class_node, module_qn, resolve_to_qn, csharp_base_kinds
+        )
+        return implemented
+
     implemented_interfaces: list[str] = []
 
     interfaces_node = class_node.child_by_field_name(cs.FIELD_INTERFACES)
@@ -309,6 +726,31 @@ def extract_implemented_interfaces(
         extract_java_interface_names(
             interfaces_node, implemented_interfaces, module_qn, resolve_to_qn
         )
+
+    # TypeScript `class C implements I, J` lives in class_heritage >
+    # implements_clause (no `interfaces` field), holding type_identifiers.
+    if class_heritage := find_child_by_type(class_node, cs.TS_CLASS_HERITAGE):
+        if implements_clause := find_child_by_type(
+            class_heritage, cs.TS_IMPLEMENTS_CLAUSE
+        ):
+            for child in implements_clause.children:
+                if child.type == cs.TS_TYPE_IDENTIFIER and child.text:
+                    if name := safe_decode_text(child):
+                        implemented_interfaces.append(resolve_to_qn(name, module_qn))
+
+    # PHP `class C implements I, J` is a class_interface_clause of `name` nodes.
+    if php_impl := find_child_by_type(class_node, cs.TS_PHP_CLASS_INTERFACE_CLAUSE):
+        for child in php_impl.children:
+            if name := php_base_simple_name(child):
+                implemented_interfaces.append(resolve_to_qn(name, module_qn))
+
+    # Dart `class C implements I, J` is an `interfaces` node of type_identifiers.
+    if dart_impl := find_child_by_type(class_node, cs.TS_DART_INTERFACES):
+        for child in dart_impl.named_children:
+            if child.type == cs.TS_DART_TYPE_IDENTIFIER and (
+                name := safe_decode_text(child)
+            ):
+                implemented_interfaces.append(resolve_to_qn(name, module_qn))
 
     return implemented_interfaces
 
@@ -322,6 +764,10 @@ def extract_java_interface_names(
     for child in interfaces_node.children:
         if child.type == cs.TS_TYPE_LIST:
             for type_child in child.children:
-                if type_child.type == cs.TS_TYPE_IDENTIFIER and type_child.text:
-                    if interface_name := safe_decode_text(type_child):
+                # Unwrap generic/qualified bases (`TBase<T>`, `pkg.IScheme`) to
+                # the base type_identifier; plain identifiers pass straight
+                # through. Skips list punctuation (commas).
+                base = java_base_type_identifier(type_child)
+                if base is not None and base.text:
+                    if interface_name := safe_decode_text(base):
                         interface_list.append(resolve_to_qn(interface_name, module_qn))

@@ -1,3 +1,16 @@
+# pre-commit.ci runs these hooks on every PR and pushes the fixes back to the
+# branch, so lint/format drift from clones without `pre-commit install` (cloud
+# sessions, fork contributors) is corrected server-side instead of failing CI.
+ci:
+  autofix_prs: true
+  autofix_commit_msg: "style: pre-commit.ci auto-fixes"
+  autoupdate_commit_msg: "chore: pre-commit autoupdate"
+  autoupdate_schedule: monthly
+  # ty and generate-readme are `language: system` hooks that need uv and the
+  # project venv; pre-commit.ci's isolated runners cannot run them. CI's Type
+  # Check job still covers ty on every PR.
+  skip: [ty, generate-readme]
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -8,7 +21,7 @@ repos:
         args: [--unsafe]
       - id: check-toml
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.12.2
+    rev: v0.15.22
     hooks:
       - id: ruff
         args: [--fix, --exit-non-zero-on-fix]
@@ -19,36 +32,36 @@ repos:
     hooks:
       - id: ty
         name: ty check
-        entry: uv run ty check --exclude codebase_rag/tests/ --exclude benchmarks/ --exclude optimize/
+        entry: uv run --frozen --no-sync ty check --exclude codebase_rag/tests/ --exclude benchmarks/ --exclude optimize/ --exclude codec/ --exclude grammars/ --exclude query_modules/
         language: system
         types: [python]
-        exclude: ^(codec/.*_pb2\.py|benchmarks/|optimize/)$
+        exclude: ^(codec/.*_pb2\.py|benchmarks/|optimize/|grammars/|query_modules/)$
         pass_filenames: false
   - repo: local
     hooks:
-      - id: check-no-docs
-        name: no module docstrings or inline comments
-        entry: uv run python scripts/check_no_docs.py
+      - id: validate-labels
+        name: validate labels.yml
+        entry: uv run --frozen --no-sync python scripts/validate_labels.py
         language: system
-        types: [python]
-        exclude: ^(codec/schema_pb2\.py|benchmarks/|optimize/)
+        files: ^\.github/labels\.yml$
+        pass_filenames: false
   - repo: local
     hooks:
       - id: generate-readme
         name: generate README sections
-        entry: uv run python scripts/hooks/generate_readme.py
+        entry: uv run --frozen --no-sync python scripts/hooks/generate_readme.py
         language: system
         pass_filenames: false
         always_run: true
   - repo: https://github.com/PyCQA/bandit
-    rev: 1.9.2
+    rev: 1.9.4
     hooks:
       - id: bandit
         args: ["-c", "pyproject.toml", "--severity-level", "high"]
         additional_dependencies: ["bandit[toml]"]
         exclude: ^(codebase_rag/tests/|scripts/|benchmarks/|optimize/)
   - repo: https://github.com/compilerla/conventional-pre-commit
-    rev: v4.2.0
+    rev: v4.4.0
     hooks:
       - id: conventional-pre-commit
         stages: [commit-msg]

@@ -31,6 +31,9 @@ SAMPLE_NODES = {
             "end_line": 20,
             "decorators": [],
             "docstring": "Gets a user.",
+            "ast_fingerprint": "f3a9c2d1e4b58607",
+            "ast_fingerprint_nodes": 21,
+            "ast_branch_fingerprints": ["11aa22bb33cc44dd", "55ee66ff77008899"],
         },
     },
 }
@@ -103,6 +106,15 @@ def test_protobuf_ingestor_joint_serialization_and_deserialization(
     assert class_payload.start_line == 10
     assert class_payload.decorators[0] == "@injectable"
 
+    method_payload = deserialized_nodes_map["test_project.UserService.get_user"]
+    assert isinstance(method_payload, pb.Method)
+    assert method_payload.ast_fingerprint == "f3a9c2d1e4b58607"
+    assert method_payload.ast_fingerprint_nodes == 21
+    assert list(method_payload.ast_branch_fingerprints) == [
+        "11aa22bb33cc44dd",
+        "55ee66ff77008899",
+    ]
+
     assert len(deserialized_index.relationships) == 1
 
     rel = deserialized_index.relationships[0]
@@ -169,3 +181,211 @@ def test_protobuf_ingestor_split_index_serialization_and_deserialization(
     assert rel.target_id == "test_project.UserService.get_user"
     assert rel.source_label == NodeType.CLASS
     assert rel.target_label == NodeType.METHOD
+
+
+def test_ensure_node_batch_no_message_class_logs_warning(tmp_path: Path) -> None:
+    from codebase_rag.services.protobuf_service import _MSG_CLASS_CACHE
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    ingestor = ProtobufFileIngestor(str(output_dir))
+
+    from codebase_rag import constants as cs
+
+    _MSG_CLASS_CACHE[cs.NodeLabel.UNION] = None
+
+    ingestor.ensure_node_batch(cs.NodeLabel.UNION, {"qualified_name": "foo.bar"})
+
+    assert "foo.bar" not in ingestor._nodes
+    _MSG_CLASS_CACHE.pop(cs.NodeLabel.UNION, None)
+
+
+def test_ensure_node_batch_no_oneof_mapping_logs_warning(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    ingestor = ProtobufFileIngestor(str(output_dir))
+
+    from codebase_rag import constants as cs
+
+    ingestor.ensure_node_batch(
+        cs.NodeLabel.PROJECT, {"name": "test_proj", "qualified_name": "test_proj"}
+    )
+    assert "test_proj" in ingestor._nodes
+
+
+def test_ensure_relationship_batch_dedup(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    ingestor = ProtobufFileIngestor(str(output_dir))
+
+    from_spec = ("Class", "qualified_name", "proj.MyClass")
+    to_spec = ("Method", "qualified_name", "proj.MyClass.method")
+    rel_type = "DEFINES_METHOD"
+
+    ingestor.ensure_relationship_batch(from_spec, rel_type, to_spec)
+    ingestor.ensure_relationship_batch(from_spec, rel_type, to_spec)
+
+    assert len(ingestor._relationships) == 1
+
+
+def test_ensure_relationship_batch_dedup_with_properties_merge(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    ingestor = ProtobufFileIngestor(str(output_dir))
+
+    from_spec = ("Class", "qualified_name", "proj.MyClass")
+    to_spec = ("Method", "qualified_name", "proj.MyClass.method")
+    rel_type = "DEFINES_METHOD"
+
+    ingestor.ensure_relationship_batch(from_spec, rel_type, to_spec)
+    ingestor.ensure_relationship_batch(from_spec, rel_type, to_spec, {"extra": "val"})
+
+    assert len(ingestor._relationships) == 1
+
+
+def test_ensure_relationship_batch_invalid_empty_source(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    ingestor = ProtobufFileIngestor(str(output_dir))
+
+    from_spec = ("Class", "qualified_name", "")
+    to_spec = ("Method", "qualified_name", "proj.MyClass.method")
+    rel_type = "DEFINES_METHOD"
+
+    ingestor.ensure_relationship_batch(from_spec, rel_type, to_spec)
+
+    assert len(ingestor._relationships) == 0
+
+
+def test_ensure_relationship_batch_invalid_empty_target(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    ingestor = ProtobufFileIngestor(str(output_dir))
+
+    from_spec = ("Class", "qualified_name", "proj.MyClass")
+    to_spec = ("Method", "qualified_name", "   ")
+    rel_type = "DEFINES_METHOD"
+
+    ingestor.ensure_relationship_batch(from_spec, rel_type, to_spec)
+
+    assert len(ingestor._relationships) == 0
+
+
+def test_ensure_relationship_batch_unknown_rel_type(tmp_path: Path) -> None:
+    from codebase_rag.services.protobuf_service import _REL_TYPE_CACHE
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    ingestor = ProtobufFileIngestor(str(output_dir))
+
+    fake_rel_type = "COMPLETELY_FAKE_REL_TYPE_XYZ"
+    _REL_TYPE_CACHE.pop(fake_rel_type, None)
+
+    from_spec = ("Class", "qualified_name", "proj.A")
+    to_spec = ("Method", "qualified_name", "proj.A.b")
+
+    ingestor.ensure_relationship_batch(from_spec, fake_rel_type, to_spec)
+
+    assert len(ingestor._relationships) == 1
+    key = next(iter(ingestor._relationships))
+    rel_obj = ingestor._relationships[key]
+    assert (
+        rel_obj.type == pb.Relationship.RelationshipType.RELATIONSHIP_TYPE_UNSPECIFIED
+    )
+
+
+def test_ensure_relationship_batch_none_values(tmp_path: Path) -> None:
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    ingestor = ProtobufFileIngestor(str(output_dir))
+
+    from_spec = ("Class", "qualified_name", None)
+    to_spec = ("Method", "qualified_name", "proj.A.b")
+
+    ingestor.ensure_relationship_batch(from_spec, "DEFINES_METHOD", to_spec)
+
+    assert len(ingestor._relationships) == 0
+
+
+def test_module_merge_preserves_rust_cfg_test_metadata(tmp_path: Path) -> None:
+    # A Module is ensured twice during a parse: the full node first, the
+    # Rust cfg(test) declaration record second (issue #1010). The protobuf
+    # sink must MERGE the later properties (mirroring the graph's
+    # SET += semantics) and the Module message must carry the fields, or
+    # protobuf output cannot reproduce the live graph's dead-code
+    # classification.
+    output_dir = tmp_path / "out_merge"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ingestor = ProtobufFileIngestor(str(output_dir), split_index=False)
+
+    ingestor.ensure_node_batch(
+        "Module",
+        {
+            "qualified_name": "proj.src.lib",
+            "name": "lib.rs",
+            "path": "src/lib.rs",
+        },
+    )
+    ingestor.ensure_node_batch(
+        "Module",
+        {
+            "qualified_name": "proj.src.lib",
+            "rust_cfg_test_mods": ["proj.src.testutil"],
+            "rust_ungated_mods": ["proj.src.util"],
+        },
+    )
+    ingestor.ensure_node_batch(
+        "Module",
+        {
+            "qualified_name": "proj.src.lib.checks",
+            "name": "checks",
+            "path": "src/lib.rs",
+            "decorators": ["#[cfg(test)]"],
+        },
+    )
+    ingestor.flush_all()
+
+    deserialized_index = pb.GraphCodeIndex()
+    deserialized_index.ParseFromString((output_dir / "index.bin").read_bytes())
+
+    modules = {
+        getattr(node, node.WhichOneof("payload")).qualified_name: getattr(
+            node, node.WhichOneof("payload")
+        )
+        for node in deserialized_index.nodes
+    }
+    declaring = modules["proj.src.lib"]
+    assert declaring.path == "src/lib.rs"
+    assert list(declaring.rust_cfg_test_mods) == ["proj.src.testutil"]
+    assert list(declaring.rust_ungated_mods) == ["proj.src.util"]
+    assert list(modules["proj.src.lib.checks"].decorators) == ["#[cfg(test)]"]
+
+
+def test_cross_label_qn_collision_does_not_clear_existing_payload(
+    tmp_path: Path,
+) -> None:
+    # Rust `mod run` and `fn run` share one qn string across labels. A
+    # later ensure under a DIFFERENT label must not merge into the stored
+    # node: writing through the other oneof field would switch the payload
+    # and clear the first label's data.
+    output_dir = tmp_path / "out_collision"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ingestor = ProtobufFileIngestor(str(output_dir), split_index=False)
+
+    ingestor.ensure_node_batch(
+        "Module",
+        {"qualified_name": "proj.src.run", "name": "run", "path": "src/run.rs"},
+    )
+    ingestor.ensure_node_batch(
+        "Function",
+        {"qualified_name": "proj.src.run", "name": "run", "start_line": 3},
+    )
+    ingestor.flush_all()
+
+    deserialized_index = pb.GraphCodeIndex()
+    deserialized_index.ParseFromString((output_dir / "index.bin").read_bytes())
+
+    assert len(deserialized_index.nodes) == 1
+    node = deserialized_index.nodes[0]
+    assert node.WhichOneof("payload") == "module"
+    assert node.module.path == "src/run.rs"

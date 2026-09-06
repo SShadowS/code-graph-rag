@@ -1,5 +1,17 @@
 syntax = "proto3";
 
+// Regenerating the bindings after editing this file:
+//
+//   uv run --with "grpcio-tools==1.76.0" python -m grpc_tools.protoc \
+//     -I. --python_out=. --pyi_out=. codec/schema.proto
+//
+// The grpcio-tools version is not incidental. Generated code carries a gencode
+// version stamp that `ValidateProtobufRuntimeVersion` checks at import, and a
+// runtime OLDER than the gencode raises rather than degrading — so generating
+// with a newer protoc than the pinned `protobuf` runtime makes `codec`
+// unimportable for everyone. 1.76.0 bundles a protoc matching the runtime
+// floor in pyproject.toml. Bump both together, runtime first.
+
 package graphcode.v1;
 
 import "google/protobuf/struct.proto";
@@ -102,6 +114,40 @@ message GraphCodeIndex {
       ExternalPackage external_package = 9;
       ModuleImplementation module_implementation = 10;
       ModuleInterface module_interface = 11;
+      Interface interface_node = 12;
+      Enum enum_node = 13;
+      Type type_node = 14;
+      Union union_node = 15;
+      ExternalModule external_module = 16;
+      Resource resource = 17;
+      Section section = 18;
+      // ast-grep findings (issue #413). Field numbering is append-only for
+      // the same reason as RelationshipType: a number is wire format.
+      Pattern pattern = 19;
+      CodeSmell code_smell = 20;
+      SecurityIssue security_issue = 21;
+      Field field = 22;
+      Key key = 23;
+      Action action = 24;
+      DataItem data_item = 25;
+      Table table = 26;
+      TableExtension table_extension = 27;
+      Page page = 28;
+      PageExtension page_extension = 29;
+      Codeunit codeunit = 30;
+      Report report = 31;
+      ReportExtension report_extension = 32;
+      EnumExtension enum_extension = 33;
+      ALQuery al_query = 34;
+      Xmlport xmlport = 35;
+      ControlAddin control_addin = 36;
+      PermissionSet permission_set = 37;
+      Entitlement entitlement = 38;
+      Profile profile = 39;
+      Procedure procedure = 40;
+      Trigger trigger = 41;
+      EventSubscriber event_subscriber = 42;
+      ExternalObject external_object = 43;
     }
   }
 
@@ -123,6 +169,35 @@ message GraphCodeIndex {
       DEPENDS_ON_EXTERNAL = 11;
       IMPLEMENTS_MODULE = 12;
       IMPLEMENTS = 13;
+      EXPORTS = 14;
+      EXPORTS_MODULE = 15;
+      READS_FROM = 16;
+      WRITES_TO = 17;
+      CONTAINS_SECTION = 18;
+      // Numbering is append-only: a field number is part of the wire format,
+      // so reusing or reordering one silently reinterprets existing indexes.
+      EXPOSES = 19;
+      FLOWS_TO = 20;
+      HAS_SMELL = 21;
+      HAS_VULNERABILITY = 22;
+      IMPLEMENTS_PATTERN = 23;
+      INSTANTIATES = 24;
+      LINKS_TO = 25;
+      REFERENCES = 26;
+      RESOLVES_TO = 27;
+      // Function/Method -> the project type its annotation names (#1527).
+      RETURNS = 28;
+      ACCEPTS = 29;
+      EXTENDS = 30;
+      SUBSCRIBES_TO = 31;
+      BINDS_TABLE = 32;
+      HAS_FIELD = 33;
+      HAS_KEY = 34;
+      HAS_TRIGGER = 35;
+      HAS_ACTION = 36;
+      HAS_DATAITEM = 37;
+      READS_TABLE = 38;
+      DISPLAYS_FIELD = 39;
     }
 
     RelationshipType type = 1;
@@ -172,6 +247,35 @@ message GraphCodeIndex {
 
     string name = 2;
     string path = 3;
+    // Rust: the module's own attributes (a bodied inline mod's
+    // `#[cfg(test)]` marks its subtree as test code, issue #1010).
+    repeated string decorators = 4;
+    // Rust: target-qn candidates of `#[cfg(test)] mod NAME;` declarations
+    // made IN this module, and the ungated counterparts that let a
+    // production target's declaration of the same file module win.
+    repeated string rust_cfg_test_mods = 5;
+    repeated string rust_ungated_mods = 6;
+    // Whether flow analysis covered this module: its language is in the
+    // source/sink registry and the FLOWS_TO capture group was enabled at
+    // indexing (issue #1050).
+    bool flow_covered = 7;
+    // Annotation-processor provenance (issue #1140): true for modules parsed
+    // from generated output, with the path-derived processor hint.
+    bool generated = 8;
+    string generator = 9;
+    // Declared Markdown front matter as "key=value" pairs (issue #164).
+    // Always emitted, empty list included, so a re-index clears metadata
+    // the document no longer declares -- SET n += row.props merges, so
+    // omitting the property could not express removal.
+    repeated string front_matter = 10;
+  }
+
+  message ExternalModule {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
   }
 
   // C++20 only
@@ -198,6 +302,293 @@ message GraphCodeIndex {
     string name = 1;
   }
 
+  // ast-grep findings (issue #413), attached to a Module and opt-in via
+  // CaptureGroup.FINDINGS. The three share a shape: Pattern is a matched
+  // structural pattern, CodeSmell a quality signal, SecurityIssue a security
+  // one. They are separate labels rather than one with a `kind`, so the graph
+  // can be queried per severity without a property filter.
+  message Pattern {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string message = 3;
+    int32 start_line = 4;
+    int32 end_line = 5;
+    string path = 6;
+    string snippet = 7;
+  }
+
+  message CodeSmell {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string message = 3;
+    int32 start_line = 4;
+    int32 end_line = 5;
+    string path = 6;
+    string snippet = 7;
+  }
+
+  message SecurityIssue {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string message = 3;
+    int32 start_line = 4;
+    int32 end_line = 5;
+    string path = 6;
+    string snippet = 7;
+  }
+
+  // An AL table field.
+  message Field {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 field_id = 3;
+    string field_type = 4;
+  }
+
+  // An AL table key over one or more fields.
+  message Key {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    repeated string fields = 3;
+  }
+
+  // An AL page action.
+  message Action {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 start_line = 3;
+    int32 end_line = 4;
+  }
+
+  // An AL report or query data item bound to a source table.
+  message DataItem {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string source_table = 3;
+    int32 start_line = 4;
+    int32 end_line = 5;
+  }
+
+  // AL secondary labels. These ride on Class and Function nodes as extra
+  // labels in the graph and are never ensured as a primary label, so the
+  // messages below exist for schema parity and are not populated by the
+  // protobuf exporter.
+  message Table {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 object_id = 3;
+    string path = 4;
+    string absolute_path = 5;
+  }
+
+  message TableExtension {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 object_id = 3;
+    string extends_target = 4;
+    string path = 5;
+    string absolute_path = 6;
+  }
+
+  message Page {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 object_id = 3;
+    string path = 4;
+    string absolute_path = 5;
+  }
+
+  message PageExtension {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 object_id = 3;
+    string extends_target = 4;
+    string path = 5;
+    string absolute_path = 6;
+  }
+
+  message Codeunit {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 object_id = 3;
+    string path = 4;
+    string absolute_path = 5;
+  }
+
+  message Report {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 object_id = 3;
+    string path = 4;
+    string absolute_path = 5;
+  }
+
+  message ReportExtension {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 object_id = 3;
+    string extends_target = 4;
+    string path = 5;
+    string absolute_path = 6;
+  }
+
+  message EnumExtension {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 object_id = 3;
+    string extends_target = 4;
+    string path = 5;
+    string absolute_path = 6;
+  }
+
+  message ALQuery {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 object_id = 3;
+    string path = 4;
+    string absolute_path = 5;
+  }
+
+  message Xmlport {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 object_id = 3;
+    string path = 4;
+    string absolute_path = 5;
+  }
+
+  message ControlAddin {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    string absolute_path = 4;
+  }
+
+  message PermissionSet {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 object_id = 3;
+    string path = 4;
+    string absolute_path = 5;
+  }
+
+  message Entitlement {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    string absolute_path = 4;
+  }
+
+  message Profile {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    string absolute_path = 4;
+  }
+
+  message Procedure {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string access_modifier = 3;
+    string path = 4;
+    string absolute_path = 5;
+  }
+
+  message Trigger {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string trigger_type = 3;
+    string path = 4;
+    string absolute_path = 5;
+  }
+
+  message EventSubscriber {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    string absolute_path = 4;
+  }
+
+  message ExternalObject {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    bool is_stub = 3;
+  }
+
+  // An external I/O resource a callable reads from or writes to
+  // (file, network endpoint, database, stream, env var, ...).
+  message Resource {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string kind = 3;
+  }
+
+  // A heading in a document, and the prose beneath it. Sections nest by
+  // heading level through CONTAINS_SECTION.
+  message Section {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    int32 heading_level = 3;
+    int32 start_line = 4;
+    int32 end_line = 5;
+    string path = 6;
+    string absolute_path = 7;
+  }
+
   message Function {
     // Primary Key
     string qualified_name = 1;
@@ -208,6 +599,14 @@ message GraphCodeIndex {
     int32 end_line = 5;
     repeated string decorators = 6;
     bool is_exported = 7;
+    // Structural clone-detection fingerprints (whole skeleton, its node
+    // count, and the statement-level branch digests).
+    string ast_fingerprint = 8;
+    int32 ast_fingerprint_nodes = 9;
+    repeated string ast_branch_fingerprints = 10;
+    // Annotations as written (#1527); absent return_type is the empty string.
+    string return_type = 11;
+    repeated string param_types = 12;
   }
 
   message Method {
@@ -219,6 +618,13 @@ message GraphCodeIndex {
     int32 start_line = 4;
     int32 end_line = 5;
     repeated string decorators = 6;
+    // Structural clone-detection fingerprints (see Function).
+    string ast_fingerprint = 7;
+    int32 ast_fingerprint_nodes = 8;
+    repeated string ast_branch_fingerprints = 9;
+    // Annotations as written (#1527); absent return_type is the empty string.
+    string return_type = 10;
+    repeated string param_types = 11;
   }
 
   message Class {
@@ -231,4 +637,36 @@ message GraphCodeIndex {
     int32 end_line = 5;
     repeated string decorators = 6;
     bool is_exported = 7;
+  }
+
+  message Interface {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    string absolute_path = 4;
+  }
+
+  message Enum {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+    string path = 3;
+    string absolute_path = 4;
+  }
+
+  message Type {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
+  }
+
+  message Union {
+    // Primary Key
+    string qualified_name = 1;
+
+    string name = 2;
   }

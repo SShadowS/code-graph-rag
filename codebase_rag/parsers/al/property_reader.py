@@ -10,7 +10,7 @@ from .utils import collect_descendants, object_body
 
 if TYPE_CHECKING:
     from ...services import IngestorProtocol
-    from ...types_defs import ASTNode
+    from ...types_defs import ASTNode, PropertyDict
 
 PAGE_TYPES = frozenset({cs.NodeLabel.PAGE, cs.NodeLabel.PAGE_EXTENSION})
 REPORT_TYPES = frozenset({cs.NodeLabel.REPORT, cs.NodeLabel.REPORT_EXTENSION})
@@ -149,7 +149,7 @@ class AlPropertyReader:
 
         dataitem_qn = f"{parent_qn}{cs.SEPARATOR_DOT}{dataitem_name}"
 
-        props: dict[str, str | int] = {
+        props: PropertyDict = {
             cs.KEY_QUALIFIED_NAME: dataitem_qn,
             cs.KEY_NAME: dataitem_name,
             cs.KEY_START_LINE: di_node.start_point[0] + 1,

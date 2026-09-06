@@ -27,14 +27,15 @@ def index_project(ingestor: MemgraphIngestor, project_path: Path) -> None:
 
 def get_imports_relationships(ingestor: MemgraphIngestor) -> list[dict]:
     query = """
-    MATCH (from:Module)-[r:IMPORTS]->(to:Module)
+    MATCH (from:Module)-[r:IMPORTS]->(to)
+    WHERE to:Module OR to:ExternalModule
     RETURN from.qualified_name AS from_qn, to.qualified_name AS to_qn
     """
     return ingestor.fetch_all(query)
 
 
 def get_module_qualified_names(ingestor: MemgraphIngestor) -> set[str]:
-    query = "MATCH (m:Module) RETURN m.qualified_name AS qn"
+    query = "MATCH (m) WHERE m:Module OR m:ExternalModule RETURN m.qualified_name AS qn"
     results = ingestor.fetch_all(query)
     return {r["qn"] for r in results}
 
@@ -596,7 +597,10 @@ class TestCppImportsRelationships:
 
         project_name = cpp_imports_project.name
         main_module = f"{project_name}.main"
-        utils_header = f"{project_name}.utils"
+        # utils.cpp claims the base qn in walk order, so the header's real
+        # module qn carries the disambiguating extension; the include edge
+        # must target the header, not the same-stem source module.
+        utils_header = f"{project_name}.utils.h"
 
         assert main_module in modules, f"Main module not found. Modules: {modules}"
         assert utils_header in modules, f"Utils header not found. Modules: {modules}"

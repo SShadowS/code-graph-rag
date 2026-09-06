@@ -1,3 +1,5 @@
+"""Runtime configuration: settings, model providers, and environment loading."""
+
 from __future__ import annotations
 
 import os
@@ -15,7 +17,11 @@ from . import exceptions as ex
 from . import logs
 from .types_defs import CgrignorePatterns, ModelConfigKwargs
 
-load_dotenv()
+# Load only the configuration file in the invocation directory.  The default
+# python-dotenv discovery walks parent directories, which can silently import
+# credentials from an unrelated workspace (and makes tests depend on the
+# caller's directory layout).
+load_dotenv(dotenv_path=Path.cwd() / ".env")
 
 
 class ApiKeyInfoEntry(TypedDict):
@@ -45,10 +51,10 @@ API_KEY_INFO: dict[str, ApiKeyInfoEntry] = {
         "url": "https://portal.azure.com/",
         "name": "Azure OpenAI",
     },
-    cs.Provider.COHERE: {
-        "env_var": "COHERE_API_KEY",
-        "url": "https://dashboard.cohere.com/api-keys",
-        "name": "Cohere",
+    cs.Provider.MINIMAX: {
+        "env_var": "MINIMAX_API_KEY",
+        "url": "https://platform.minimax.io/user-center/basic-information/interface-key",
+        "name": "MiniMax",
     },
 }
 
@@ -95,7 +101,7 @@ def format_missing_api_key_errors(
     return error_msg
 
 
-LOCAL_PROVIDERS = frozenset({cs.Provider.OLLAMA, cs.Provider.LOCAL, cs.Provider.VLLM})
+LOCAL_PROVIDERS = frozenset({cs.Provider.OLLAMA})
 
 
 @dataclass
@@ -121,6 +127,7 @@ class ModelConfig:
         provider_env_keys = {
             cs.Provider.ANTHROPIC: cs.ENV_ANTHROPIC_API_KEY,
             cs.Provider.AZURE: cs.ENV_AZURE_API_KEY,
+            cs.Provider.MINIMAX: cs.ENV_MINIMAX_API_KEY,
         }
         env_key = provider_env_keys.get(provider_lower)
         if (
@@ -143,7 +150,7 @@ class ModelConfig:
 
 class AppConfig(BaseSettings):
     """
-    (H) All settings are loaded from environment variables or a .env file.
+    All settings are loaded from environment variables or a .env file.
     """
 
     model_config = SettingsConfigDict(
@@ -189,6 +196,37 @@ class AppConfig(BaseSettings):
         return f"{self.OLLAMA_BASE_URL.rstrip('/')}/v1"
 
     TARGET_REPO_PATH: str = "."
+    # HYBRID degrades to pure tree-sitter when libclang or compile_commands.json
+    # is missing, so it is a safe default and strictly better (macros, includes,
+    # expansion calls) with one.
+    CPP_FRONTEND: cs.CppFrontend = cs.CppFrontend.HYBRID
+    # Opt-in Roslyn semantic layer for C#. Defaults to pure tree-sitter because
+    # HYBRID needs a dotnet SDK + a restorable .csproj/.sln and degrades without
+    # them. HYBRID augments (base-vs-interface, overload and extension binding,
+    # partial-class identity); tree-sitter stays the standalone-correct backbone.
+    # Default to tree-sitter so indexing an untrusted repository never auto-invokes
+    # MSBuild/Roslyn; opt into AUTO/HYBRID/ROSLYN explicitly (security, #1231).
+    CSHARP_FRONTEND: cs.CSharpFrontend = cs.CSharpFrontend.TREESITTER
+    # Opt-in go/packages semantic layer for Go (issue #1179). AUTO uses it where a
+    # go toolchain is on PATH and degrades to pure tree-sitter otherwise. GOTYPES
+    # augments exact first-party call binding and external-site suppression;
+    # tree-sitter stays the standalone-correct backbone.
+    GO_FRONTEND: cs.GoFrontend = cs.GoFrontend.AUTO
+    PYTHON_FRONTEND: cs.PythonFrontend = cs.PythonFrontend.HEURISTIC
+    JAVA_FRONTEND: cs.JavaFrontend = cs.JavaFrontend.HEURISTIC
+    LOMBOK_JAR: str | None = None
+    CAPTURE_FUNCTION_LOCAL_DEFINITIONS: bool = Field(
+        True, validation_alias="CGR_CAPTURE_LOCAL_DEFINITIONS"
+    )
+    CGR_HOME: Path = Field(default_factory=lambda: Path.home() / ".cgr")
+    # Editor integration for clickable report locations (OSC 8 hyperlinks)
+    # and `cgr duplicates --open`. AUTO sniffs the hosting app (Cursor,
+    # Windsurf, Zed, VS Code's terminal) and falls back to VS Code; the
+    # templates override any editor choice. See EDITOR_URL_TEMPLATES for
+    # the named editors and the {path}/{line} and {left}/{right} slots.
+    CGR_EDITOR: str = cs.EDITOR_AUTO
+    CGR_EDITOR_URL_TEMPLATE: str | None = None
+    CGR_DIFF_COMMAND: str | None = None
     SHELL_COMMAND_TIMEOUT: int = 30
     SHELL_COMMAND_ALLOWLIST: frozenset[str] = frozenset(
         {
@@ -222,45 +260,72 @@ class AppConfig(BaseSettings):
             "tee",
         }
     )
+    # Only commands that cannot accept filesystem paths are approval-free.
+    # Filesystem and Git reads require approval because their path syntaxes can
+    # escape the project root (absolute paths, traversal, symlinks, git -C, and
+    # --git-dir). Project-confined read/search tools should be preferred instead.
     SHELL_READ_ONLY_COMMANDS: frozenset[str] = frozenset(
         {
+            "pwd",
+            "echo",
+            "tr",
+        }
+    )
+    SHELL_SAFE_GIT_SUBCOMMANDS: frozenset[str] = frozenset()
+    # Read-only, path-taking commands a NON-INTERACTIVE session (benchmark
+    # harnesses, batch jobs) may run without an operator. Kept a subset of
+    # SHELL_COMMAND_ALLOWLIST; the non-interactive wrapper additionally
+    # rejects redirects, find's mutating actions, and absolute or
+    # parent-traversal path arguments, so these reads stay inside the
+    # project root.
+    SHELL_NONINTERACTIVE_READ_COMMANDS: frozenset[str] = frozenset(
+        {
             "ls",
+            "rg",
             "cat",
             "find",
-            "pwd",
-            "rg",
-            "echo",
             "wc",
             "head",
             "tail",
             "sort",
             "uniq",
             "cut",
-            "tr",
-        }
-    )
-    SHELL_SAFE_GIT_SUBCOMMANDS: frozenset[str] = frozenset(
-        {
-            "status",
-            "log",
-            "diff",
-            "show",
-            "ls-files",
-            "remote",
-            "config",
-            "branch",
         }
     )
 
     QDRANT_DB_PATH: str = "./.qdrant_code_embeddings"
+    QDRANT_URL: str | None = None
     QDRANT_COLLECTION_NAME: str = "code_embeddings"
     QDRANT_VECTOR_DIM: int = 768
     QDRANT_TOP_K: int = 5
     QDRANT_UPSERT_RETRIES: int = Field(default=3, gt=0)
     QDRANT_RETRY_BASE_DELAY: float = Field(default=0.5, gt=0)
     QDRANT_BATCH_SIZE: int = Field(default=50, gt=0)
+    VECTOR_STORE_BACKEND: cs.VectorStoreBackend = Field(
+        cs.VectorStoreBackend.QDRANT, validation_alias="CGR_VECTOR_STORE_BACKEND"
+    )
+    MILVUS_URI: str = "./.milvus_code_embeddings.db"
+    MILVUS_TOKEN: str | None = None
+    MILVUS_DB_NAME: str | None = None
+    MILVUS_COLLECTION_NAME: str = "code_embeddings"
+    MILVUS_VECTOR_DIM: int = 768
+    MILVUS_TOP_K: int = 5
+    MILVUS_CONSISTENCY_LEVEL: str = "Strong"
+    EMBEDDING_PROVIDER: cs.EmbeddingProvider = Field(
+        cs.EmbeddingProvider.UNIXCODER, validation_alias="CGR_EMBEDDING_PROVIDER"
+    )
+    OPENAI_EMBEDDING_BASE_URL: str = cs.OPENAI_DEFAULT_ENDPOINT
+    OPENAI_EMBEDDING_MODEL: str = cs.OPENAI_EMBEDDING_DEFAULT_MODEL
+    OPENAI_EMBEDDING_API_KEY: str | None = None
+    OPENAI_EMBEDDING_DIMENSIONS: int | None = Field(default=None, gt=0)
+    OPENAI_EMBEDDING_BATCH_SIZE: int = Field(default=128, gt=0)
+    OPENAI_EMBEDDING_TIMEOUT: float = Field(default=60.0, gt=0)
     EMBEDDING_MAX_LENGTH: int = 512
     EMBEDDING_PROGRESS_INTERVAL: int = 10
+    SKIP_EMBEDDINGS: bool = Field(False, validation_alias="CGR_SKIP_EMBEDDINGS")
+    EMBEDDING_DEVICE: cs.EmbeddingDevice | None = Field(
+        None, validation_alias="CGR_EMBEDDING_DEVICE"
+    )
 
     FLUSH_THREAD_POOL_SIZE: int = Field(default=4, gt=0)
     FILE_FLUSH_INTERVAL: int = Field(default=500, gt=0)
@@ -271,18 +336,53 @@ class AppConfig(BaseSettings):
     CACHE_MEMORY_THRESHOLD_RATIO: float = 0.8
 
     QUERY_RESULT_MAX_TOKENS: int = Field(default=16000, gt=0)
+    # The model's OUTPUT budget per request. Without it pydantic-ai falls back
+    # to the provider default, which on Anthropic is far below what current
+    # models support -- a long answer then fails with "Model token limit
+    # (provider default) exceeded before any response was generated" and the
+    # model never replies at all (issue #1498).
+    #
+    # Distinct from QUERY_RESULT_MAX_TOKENS above, which trims what goes IN.
+    # This bounds what comes back.
+    # 8192 rather than something larger: pydantic-ai forwards this value
+    # unchanged and exposes no per-model output cap to clamp against, so the
+    # default must fit the SMALLEST catalogued model or it breaks working
+    # configurations. `gemini-2.0-flash` caps output at 8192 and is
+    # selectable today; 16000 was rejected outright by it. This still fixes
+    # the reported crash, whose remedy is any value meaningfully above
+    # Anthropic's 4096 provider default.
+    #
+    # Raise it per-deployment when the chosen model allows more. A general
+    # clamping table over every model was rejected: it would need
+    # hand-maintaining and would silently go stale on every new release,
+    # capping a launch below what it supports. Retired snapshots are the
+    # exception -- their maxima are frozen -- so `LEGACY_MAX_OUTPUT_TOKENS`
+    # lowers this budget for those ids alone, leaving everything else at the
+    # configured value.
+    MODEL_MAX_TOKENS: int = Field(default=8192, gt=0)
     QUERY_RESULT_ROW_CAP: int = Field(default=500, gt=0)
+    QUERY_MEMORY_LIMIT_MB: int = Field(default=4096, gt=0)
+    QUERY_TIMEOUT_S: float = Field(default=60.0, gt=0)
 
     OLLAMA_HEALTH_TIMEOUT: float = 5.0
+    LITELLM_HEALTH_TIMEOUT: float = 5.0
 
     _active_orchestrator: ModelConfig | None = None
     _active_cypher: ModelConfig | None = None
 
     QUIET: bool = Field(False, validation_alias="CGR_QUIET")
 
-    MCP_HTTP_HOST: str = "0.0.0.0"
+    CGR_CAPTURE: str = Field("", validation_alias="CGR_CAPTURE")
+
+    # Loopback by default: the StreamableHTTP endpoint has no built-in
+    # auth, so exposing it beyond the host must be an explicit operator
+    # choice via MCP_HTTP_HOST (issue #808).
+    MCP_HTTP_HOST: str = "127.0.0.1"
     MCP_HTTP_PORT: int = 8080
     MCP_HTTP_ENDPOINT_PATH: str = "/mcp"
+    # Bearer token for the HTTP MCP endpoint; unset means loopback-only
+    # (serve_http refuses a non-loopback bind without it).
+    MCP_HTTP_AUTH_TOKEN: str | None = None
 
     def _get_default_config(self, role: str) -> ModelConfig:
         role_upper = role.upper()
@@ -356,13 +456,13 @@ class AppConfig(BaseSettings):
 settings = AppConfig()
 
 CGRIGNORE_FILENAME = ".cgrignore"
+GITIGNORE_FILENAME = ".gitignore"
 
 
 EMPTY_CGRIGNORE = CgrignorePatterns(exclude=frozenset(), unignore=frozenset())
 
 
-def load_cgrignore_patterns(repo_path: Path) -> CgrignorePatterns:
-    ignore_file = repo_path / CGRIGNORE_FILENAME
+def _load_ignore_file(ignore_file: Path) -> CgrignorePatterns:
     if not ignore_file.is_file():
         return EMPTY_CGRIGNORE
 
@@ -390,6 +490,61 @@ def load_cgrignore_patterns(repo_path: Path) -> CgrignorePatterns:
             exclude=frozenset(exclude),
             unignore=frozenset(unignore),
         )
-    except OSError as e:
+    except (OSError, ValueError) as e:
         logger.warning(logs.CGRIGNORE_READ_FAILED.format(path=ignore_file, error=e))
         return EMPTY_CGRIGNORE
+
+
+def load_cgrignore_patterns(repo_path: Path) -> CgrignorePatterns:
+    return _load_ignore_file(repo_path / CGRIGNORE_FILENAME)
+
+
+def load_ignore_patterns(repo_path: Path) -> CgrignorePatterns:
+    # Merged exclude/unignore set for indexing: root .gitignore (gitignored
+    # paths are build artifacts and generated output that pollute the graph and
+    # dead-code report) plus .cgrignore, the authoritative cgr channel. The skip
+    # check gives excludes precedence, so a negation overrides a .gitignore
+    # exclude only by CANCELLING the exact pattern (`!generated/` drops
+    # `generated/`); .cgrignore excludes are never cancelled.
+    # ponytail: root .gitignore only, exact-string cancellation only; a
+    # finer-grained negation (`!dist/keep.py` under excluded `dist/`) still
+    # cannot rescue -- an ordered PathSpec soft layer in should_skip_path is
+    # the upgrade path if real repos need it.
+    cgr = _load_ignore_file(repo_path / CGRIGNORE_FILENAME)
+    git = _load_ignore_file(repo_path / GITIGNORE_FILENAME)
+    negations = cgr.unignore | git.unignore
+    return CgrignorePatterns(
+        exclude=cgr.exclude | (git.exclude - negations),
+        unignore=negations,
+    )
+
+
+CGR_INSTRUCTIONS_FILENAME = ".cgr.md"
+GLOBAL_CGR_INSTRUCTIONS_PATH = Path.home() / CGR_INSTRUCTIONS_FILENAME
+
+
+def _read_cgr_instructions_file(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    try:
+        with path.open(encoding="utf-8") as f:
+            body = f.read().strip()
+    except OSError as e:
+        logger.warning(logs.CGR_INSTRUCTIONS_READ_FAILED.format(path=path, error=e))
+        return None
+    if not body:
+        return None
+    logger.info(logs.CGR_INSTRUCTIONS_LOADED.format(path=path, chars=len(body)))
+    return body
+
+
+def load_cgr_instructions(repo_path: Path | None) -> str | None:
+    global_body = _read_cgr_instructions_file(GLOBAL_CGR_INSTRUCTIONS_PATH)
+    repo_body = (
+        _read_cgr_instructions_file(repo_path / CGR_INSTRUCTIONS_FILENAME)
+        if repo_path is not None
+        else None
+    )
+    if global_body and repo_body:
+        return f"{global_body}\n\n---\n\n{repo_body}"
+    return global_body or repo_body

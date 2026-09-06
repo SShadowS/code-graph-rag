@@ -6,6 +6,18 @@ description: "Complete CLI reference for Code-Graph-RAG commands and Makefile ta
 
 The `cgr` command is the main entry point for Code-Graph-RAG.
 
+## Built-in Help
+
+List commands by workflow or show the detailed page for a command:
+
+```bash
+cgr help
+cgr help start
+cgr help daemon logs
+```
+
+`cgr COMMAND --help` displays the same command-specific information.
+
 ## Core Commands
 
 ### `cgr start`
@@ -20,11 +32,12 @@ cgr start --repo-path /path/to/repo [OPTIONS]
 |--------|-------------|
 | `--repo-path` | Path to repository (defaults to current directory) |
 | `--update-graph` | Parse and ingest the repository into the knowledge graph |
-| `--clean` | Clear existing data before ingesting |
+| `--clean` | **Destructive.** Delete every project from the shared graph and clear the selected repository's sync cache. With `--update-graph`, rebuild after deletion. Asks for confirmation when other projects would be destroyed. |
+| `-y`, `--yes` | Answer yes to destructive confirmations, such as the one `--clean` asks. Required when `--clean` runs non-interactively and other projects would be destroyed, or when the existing projects cannot be listed. |
 | `--batch-size` | Override Memgraph flush batch size |
-| `--orchestrator` | Specify provider:model for main operations (e.g., `google:gemini-2.5-pro`, `ollama:llama3.2`) |
-| `--cypher` | Specify provider:model for graph queries (e.g., `google:gemini-2.5-flash`, `ollama:codellama`) |
-| `-o` | Export graph to JSON file during update |
+| `--orchestrator` | Specify provider:model for main operations (e.g., `anthropic:claude-sonnet-5`, `google:gemini-3.6-flash`, `ollama:qwen2.5-coder`) |
+| `--cypher` | Specify provider:model for graph queries (e.g., `anthropic:claude-sonnet-5`, `google:gemini-3.5-flash-lite`, `ollama:qwen2.5-coder`) |
+| `-o`, `--output` | Write the updated graph to a JSON path. Requires `--update-graph`. |
 
 ### `cgr export`
 
@@ -36,7 +49,7 @@ cgr export -o my_graph.json
 
 ### `cgr optimize`
 
-AI-powered codebase optimization.
+AI-powered codebase optimisation.
 
 ```bash
 cgr optimize <language> --repo-path /path/to/repo [OPTIONS]
@@ -47,13 +60,55 @@ cgr optimize <language> --repo-path /path/to/repo [OPTIONS]
 | `--repo-path` | Path to repository |
 | `--orchestrator` | Specify provider:model for operations |
 | `--batch-size` | Override Memgraph flush batch size |
-| `--reference-document` | Path to reference documentation for guided optimization |
+| `--reference-document` | Path to reference documentation for guided optimisation |
 
-Supported languages: `python`, `javascript`, `typescript`, `rust`, `go`, `java`, `scala`, `cpp`
+Supported languages: `python`, `javascript`, `typescript`, `rust`, `go`, `java`, `scala`, `c`, `cpp`
+
+### `cgr dead-code`
+
+Report functions and methods unreachable from any entry point (candidates for
+review, not a guaranteed delete list). See [Dead Code Detection](dead-code.md).
+
+```bash
+cgr dead-code [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--project-name`, `-n` | Project to scan. Defaults to the sole indexed project. |
+| `--entry-point`, `-e` | Treat symbols whose qualified name ends with this value as reachable roots. Repeatable. |
+| `--decorator-root` | Treat symbols carrying this decorator as roots. Repeatable. |
+| `--exclude` | Glob matched against a symbol's whole repo-relative file path to exclude it; quote it. Repeatable. |
+| `--include-tests` / `--no-include-tests` | Treat test code as reachable roots. On by default. |
+| `--classes` / `--no-classes` | Also report unreachable classes. Off by default. |
+| `--format` | Output format: `table` (default) or `json`. |
+| `--output`, `-o` | Write the report to a file instead of stdout. |
+| `--fail-on-found` | Exit with code 1 when any candidate is found (useful in CI). |
+
+### `cgr duplicates`
+
+Report groups of structurally duplicated functions and methods (copy-pastes,
+including renamed and lightly edited copies). See
+[Duplicate Code Detection](duplicates.md).
+
+```bash
+cgr duplicates [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--project-name`, `-n` | Project to scan. Defaults to the sole indexed project. |
+| `--threshold` | Minimum similarity for a near-duplicate pair, 0-1. Default `0.8`. |
+| `--min-size` | Minimum skeleton size (tree nodes) for a function to be considered. Default `15`. |
+| `--exact-only` | Report only identical-fingerprint clone groups; skip similarity scoring. |
+| `--exclude` | Glob matched against a symbol's whole repo-relative file path to exclude it; quote it. Repeatable. |
+| `--format` | Output format: `table` (default) or `json`. |
+| `--output`, `-o` | Write the report to a file instead of stdout. |
+| `--fail-on-found` | Exit with code 1 when any duplicate is found (useful in CI). |
 
 ### `cgr mcp-server`
 
-Start the MCP server for Claude Code integration.
+Serve cgr tools to MCP clients over stdio or HTTP.
 
 ```bash
 cgr mcp-server

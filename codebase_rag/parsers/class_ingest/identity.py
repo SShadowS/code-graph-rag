@@ -7,7 +7,7 @@ from tree_sitter import Node
 
 from ... import constants as cs
 from ...language_spec import LANGUAGE_FQN_SPECS
-from ...utils.fqn_resolver import resolve_fqn_from_ast
+from .. import export_detection
 from ..cpp import utils as cpp_utils
 from ..rs import utils as rs_utils
 from ..utils import safe_decode_text
@@ -22,22 +22,32 @@ def resolve_class_identity(
     language: cs.SupportedLanguage,
     lang_config: LanguageSpec,
     file_path: Path | None,
-    repo_path: Path,
-    project_name: str,
 ) -> tuple[str, str, bool] | None:
     if (fqn_config := LANGUAGE_FQN_SPECS.get(language)) and file_path:
-        if class_qn := resolve_fqn_from_ast(
-            class_node,
-            file_path,
-            repo_path,
-            project_name,
-            fqn_config,
-        ):
-            class_name = class_qn.split(cs.SEPARATOR_DOT)[-1]
-            is_exported = language == cs.SupportedLanguage.CPP and (
-                class_node.type == cs.CppNodeType.FUNCTION_DEFINITION
-                or cpp_utils.is_exported(class_node)
-            )
+        class_name = fqn_config.get_name(class_node)
+        if class_name:
+            parts = [class_name]
+            current = class_node.parent
+            while current:
+                if current.type in fqn_config.scope_node_types:
+                    if scope_name := fqn_config.get_name(current):
+                        parts.append(scope_name)
+                current = current.parent
+            parts.reverse()
+
+            # Use the module's already-resolved (and collision-disambiguated)
+            # qualified name as the prefix rather than recomputing from the path,
+            # so same-stem cross-language siblings get distinct class/method qns.
+            class_qn = module_qn + cs.SEPARATOR_DOT + cs.SEPARATOR_DOT.join(parts)
+            if language == cs.SupportedLanguage.CPP:
+                is_exported = (
+                    class_node.type == cs.CppNodeType.FUNCTION_DEFINITION
+                    or cpp_utils.is_exported(class_node)
+                )
+            else:
+                is_exported = export_detection.is_exported(
+                    class_node, class_name, language
+                )
             return class_qn, class_name, is_exported
 
     return resolve_class_identity_fallback(class_node, module_qn, language, lang_config)
@@ -68,7 +78,8 @@ def resolve_class_identity_fallback(
     nested_qn = build_nested_qualified_name_for_class(
         class_node, module_qn, class_name, lang_config
     )
-    return nested_qn or f"{module_qn}.{class_name}", class_name, False
+    is_exported = export_detection.is_exported(class_node, class_name, language)
+    return nested_qn or f"{module_qn}.{class_name}", class_name, is_exported
 
 
 def extract_cpp_class_name(class_node: Node) -> str | None:
@@ -106,12 +117,18 @@ def build_nested_qualified_name_for_class(
     module_qn: str,
     class_name: str,
     lang_config: LanguageSpec,
+    include_impl_targets: bool = False,
 ) -> str | None:
     if not isinstance(class_node.parent, Node):
         return None
 
+    # An inline mod under an `impl Type` body keys under that target
+    # (foo.S.inner), exactly as the items inside it do, so their DEFINES chain
+    # agrees with the Module node (issue #1018). Class/struct qns keep the
+    # default (impl targets excluded) so this stays opt-in.
     path_parts = rs_utils.build_module_path(
         class_node,
+        include_impl_targets=include_impl_targets,
         include_classes=True,
         class_node_types=lang_config.class_node_types,
     )

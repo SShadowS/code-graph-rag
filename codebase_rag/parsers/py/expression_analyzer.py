@@ -11,7 +11,7 @@ from ... import logs as lg
 from ...decorators import recursion_guard
 from ...types_defs import FunctionRegistryTrieProtocol, NodeType, SimpleNameLookup
 from ..import_processor import ImportProcessor
-from ..utils import safe_decode_text
+from ..utils import follow_reexports, safe_decode_text
 from .utils import resolve_class_name
 
 if TYPE_CHECKING:
@@ -30,8 +30,10 @@ if TYPE_CHECKING:
 
         def _find_method_ast_node(self, method_qn: str) -> Node | None: ...
 
+        def _find_function_ast_node(self, fn_qn: str) -> Node | None: ...
+
         def _analyze_method_return_statements(
-            self, method_node: Node, method_qn: str
+            self, method_node: Node, method_qn: str, module_qn: str | None = None
         ) -> str | None: ...
 
     _ExprBase: type = _ExpressionAnalyzerDeps
@@ -48,32 +50,53 @@ class PythonExpressionAnalyzerMixin(_ExprBase):
     ast_cache: ASTCacheProtocol
 
     _method_return_type_cache: dict[str, str | None]
+    _self_assignment_cache: dict[tuple[Node, str], dict[str, str] | None]
 
     def _infer_type_from_expression(self, node: Node, module_qn: str) -> str | None:
         if node.type == cs.TS_PY_CALL:
-            func_node = node.child_by_field_name(cs.TS_FIELD_FUNCTION)
-            if (
-                func_node
-                and func_node.type == cs.TS_PY_IDENTIFIER
-                and func_node.text is not None
-                and (class_name := safe_decode_text(func_node))
-                and class_name[0].isupper()
+            return self._infer_call_expression_type(node, module_qn)
+        if node.type == cs.TS_PY_LIST_COMPREHENSION and (
+            body_node := node.child_by_field_name(cs.TS_FIELD_BODY)
+        ):
+            return self._infer_type_from_expression(body_node, module_qn)
+        return None
+
+    def _infer_call_expression_type(self, node: Node, module_qn: str) -> str | None:
+        func_node = node.child_by_field_name(cs.TS_FIELD_FUNCTION)
+        if (
+            func_node
+            and func_node.type == cs.TS_PY_IDENTIFIER
+            and func_node.text is not None
+            and (callee := safe_decode_text(func_node))
+        ):
+            if callee[0].isupper():
+                return callee
+            # A lowercase callee is a free-function factory: type from its
+            # return (annotation first), so `self.widgets = load_widgets()`
+            # seeds the attribute for methods that only read it.
+            return self._infer_free_function_return_type(callee, module_qn)
+
+        if (
+            func_node
+            and func_node.type == cs.TS_PY_ATTRIBUTE
+            and (method_call_text := self._extract_full_method_call(func_node))
+        ):
+            if inferred := self._infer_method_call_return_type(
+                method_call_text, module_qn, None
             ):
-                return class_name
+                return inferred
+            return self._attribute_constructor_type(method_call_text)
+        return None
 
-            if (
-                func_node
-                and func_node.type == cs.TS_PY_ATTRIBUTE
-                and (method_call_text := self._extract_full_method_call(func_node))
-            ):
-                return self._infer_method_call_return_type(
-                    method_call_text, module_qn, None
-                )
-
-        elif node.type == cs.TS_PY_LIST_COMPREHENSION:
-            if body_node := node.child_by_field_name(cs.TS_FIELD_BODY):
-                return self._infer_type_from_expression(body_node, module_qn)
-
+    def _attribute_constructor_type(self, method_call_text: str) -> str | None:
+        # alias.ClassName(...) is an attribute CONSTRUCTOR (pd.DataFrame,
+        # genai.Client), not a method call: the variable's type is the dotted class
+        # itself. Without this the receiver stays untyped, known-external suppression
+        # cannot fire, and a later member call (df.apply) rebinds by bare name to an
+        # unrelated first-party method. Mirrors the bare `ClassName(...)` heuristic.
+        simple_name = method_call_text.rsplit(cs.SEPARATOR_DOT, 1)[-1]
+        if simple_name and simple_name[0].isupper():
+            return method_call_text
         return None
 
     def _infer_type_from_expression_simple(
@@ -106,9 +129,22 @@ class PythonExpressionAnalyzerMixin(_ExprBase):
                 and func_node.type == cs.TS_PY_ATTRIBUTE
                 and (method_call_text := self._extract_full_method_call(func_node))
             ):
-                return self._infer_method_call_return_type(
+                if inferred := self._infer_method_call_return_type(
                     method_call_text, module_qn, local_var_types
-                )
+                ):
+                    return inferred
+                return self._attribute_constructor_type(method_call_text)
+
+            if (
+                func_node
+                and func_node.type == cs.TS_PY_IDENTIFIER
+                and func_node.text is not None
+                and (callee := safe_decode_text(func_node))
+            ):
+                # `r = make_widget()`: type the local from the free-function
+                # factory's return so the later `r.run()` does not fall back to
+                # the bare-name trie.
+                return self._infer_free_function_return_type(callee, module_qn)
 
         return None
 
@@ -116,11 +152,9 @@ class PythonExpressionAnalyzerMixin(_ExprBase):
         return safe_decode_text(attr_node) if attr_node.text else None
 
     @recursion_guard(
-        key_func=lambda self,
-        method_call,
-        module_qn,
-        *_,
-        **__: f"{module_qn}:{method_call}",
+        key_func=lambda self, method_call, module_qn, *_, **__: (
+            f"{module_qn}:{method_call}"
+        ),
         guard_name=cs.ATTR_TYPE_INFERENCE_IN_PROGRESS,
     )
     def _infer_method_call_return_type(
@@ -134,7 +168,69 @@ class PythonExpressionAnalyzerMixin(_ExprBase):
                 method_call, module_qn, local_var_types
             )
 
+        if cs.SEPARATOR_DOT not in method_call and cs.CHAR_PAREN_OPEN in method_call:
+            # A bare call as chain receiver (`get_resolver()._is_callback()`,
+            # django) is a free-function factory or a constructor; type it from
+            # the callee's return.
+            callee = method_call.split(cs.CHAR_PAREN_OPEN, 1)[0].strip()
+            if callee.isidentifier():
+                return self._infer_free_function_return_type(callee, module_qn)
+            return None
+
         return self._infer_method_return_type(method_call, module_qn, local_var_types)
+
+    def _infer_free_function_return_type(
+        self, callee: str, module_qn: str
+    ) -> str | None:
+        # Resolve a bare callee in the caller's scope only (same module, then
+        # imports); Python scoping admits nothing else for a bare name, and a global
+        # simple-name fallback would rebind common names. A CLASS callee is a
+        # constructor: the returned type is the class itself.
+        local_qn = f"{module_qn}{cs.SEPARATOR_DOT}{callee}"
+        candidates = [local_qn]
+        if imported := self.import_processor.import_mapping.get(module_qn, {}).get(
+            callee
+        ):
+            # The import may name a package re-export hop (django's
+            # `from django.urls import get_resolver`), not the definition.
+            candidates.append(
+                follow_reexports(
+                    imported,
+                    self.import_processor.import_mapping,
+                    self.function_registry,
+                )
+            )
+        for qn in candidates:
+            match self.function_registry.get(qn):
+                case NodeType.CLASS:
+                    return qn
+                case NodeType.FUNCTION:
+                    return self._get_function_return_type_from_ast(qn)
+                case _:
+                    continue
+        return None
+
+    @recursion_guard(
+        key_func=lambda self, fn_qn: fn_qn,
+        guard_name=cs.ATTR_TYPE_INFERENCE_IN_PROGRESS,
+    )
+    def _get_function_return_type_from_ast(self, fn_qn: str) -> str | None:
+        if fn_qn in self._method_return_type_cache:
+            return self._method_return_type_cache[fn_qn]
+
+        fn_module_qn = fn_qn.rsplit(cs.SEPARATOR_DOT, 1)[0]
+        fn_node = self._find_function_ast_node(fn_qn)
+        result = (
+            self._analyze_method_return_statements(fn_node, fn_qn, fn_module_qn)
+            if fn_node
+            else None
+        )
+        if result and cs.SEPARATOR_DOT not in result:
+            # Resolve a bare class name in the FACTORY's module scope before it
+            # crosses into a caller module where the class is not imported.
+            result = self._resolve_class_name(result, fn_module_qn) or result
+        self._method_return_type_cache[fn_qn] = result
+        return result
 
     def _is_method_chain(self, call_name: str) -> bool:
         return (
@@ -274,7 +370,7 @@ class PythonExpressionAnalyzerMixin(_ExprBase):
 
             return self._resolve_class_method(class_name, method_name, module_qn)
 
-        if parts[0] == cs.PY_KEYWORD_SELF and len(parts) >= 3:
+        if parts[0] == cs.PY_KEYWORD_SELF:
             attribute_name = parts[1]
             method_name = parts[-1]
 
@@ -283,12 +379,9 @@ class PythonExpressionAnalyzerMixin(_ExprBase):
                     attribute_type, method_name, module_qn
                 )
 
-        if len(parts) >= 3:
-            potential_class = parts[-2]
-            method_name = parts[-1]
-            return self._resolve_class_method(potential_class, method_name, module_qn)
-
-        return None
+        potential_class = parts[-2]
+        method_name = parts[-1]
+        return self._resolve_class_method(potential_class, method_name, module_qn)
 
     def _resolve_class_method(
         self, class_name: str, method_name: str, module_qn: str
@@ -341,15 +434,23 @@ class PythonExpressionAnalyzerMixin(_ExprBase):
     ) -> str | None:
         try:
             file_path = self.module_qn_to_file_path.get(module_qn)
-            if not file_path or file_path not in self.ast_cache:
+            if not file_path or not (entry := self.ast_cache.load(file_path)):
                 return None
 
-            root_node, language = self.ast_cache[file_path]
+            root_node, language = entry
             if language != cs.SupportedLanguage.PYTHON:
                 return None
 
-            instance_vars: dict[str, str] = {}
-            self._analyze_self_assignments(root_node, instance_vars, module_qn)
+            cache_key = (root_node, module_qn)
+            if cache_key in self._self_assignment_cache:
+                instance_vars = self._self_assignment_cache[cache_key]
+            else:
+                instance_vars = {}
+                self._analyze_self_assignments(root_node, instance_vars, module_qn)
+                self._self_assignment_cache[cache_key] = instance_vars or None
+
+            if not instance_vars:
+                return None
 
             full_attr_name = f"{cs.PY_SELF_PREFIX}{attribute_name}"
             return instance_vars.get(full_attr_name)

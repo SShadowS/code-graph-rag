@@ -94,7 +94,7 @@ def test_analyze_self_assignments_handles_deep_tree_without_recursion_error() ->
     local_types: dict[str, Any] = {}
 
     with patch.object(type(py_engine), "_infer_type_from_expression", mock_infer):
-        py_engine._analyze_self_assignments(root, local_types, "proj.module")  # ty: ignore[invalid-argument-type]  # (H) NodeStub not Node
+        py_engine._analyze_self_assignments(root, local_types, "proj.module")  # ty: ignore[invalid-argument-type]  # NodeStub not Node
 
     assert local_types, "Expected at least one inferred instance variable"
     assert mock_infer.call_count == 1500
@@ -107,7 +107,7 @@ def test_find_return_statements_handles_deep_tree_without_recursion_error() -> N
     root = _build_deep_return_tree(depth=1500)
     returns: list[NodeStub] = []
 
-    py_engine._find_return_statements(root, returns)  # ty: ignore[invalid-argument-type]  # (H) NodeStub not Node
+    py_engine._find_return_statements(root, returns)  # ty: ignore[invalid-argument-type]  # NodeStub not Node
 
     assert len(returns) == 1501
 
@@ -193,7 +193,9 @@ class TestBuildLocalVariableTypeMapDispatch:
             )
 
         assert result == expected
-        mock_method.assert_called_once_with(mock_node, "proj.module")
+        mock_method.assert_called_once_with(
+            mock_node, "proj.module", cs.SupportedLanguage.JS
+        )
 
     def test_dispatches_to_ts_engine(
         self, engine: TypeInferenceEngine, mock_node: MagicMock
@@ -211,7 +213,9 @@ class TestBuildLocalVariableTypeMapDispatch:
             )
 
         assert result == expected
-        mock_method.assert_called_once_with(mock_node, "proj.module")
+        mock_method.assert_called_once_with(
+            mock_node, "proj.module", cs.SupportedLanguage.TS
+        )
 
     def test_dispatches_to_java_engine(
         self, engine: TypeInferenceEngine, mock_node: MagicMock
@@ -255,8 +259,6 @@ class TestBuildLocalVariableTypeMapDispatch:
             cs.SupportedLanguage.RUST,
             cs.SupportedLanguage.GO,
             cs.SupportedLanguage.SCALA,
-            cs.SupportedLanguage.CPP,
-            cs.SupportedLanguage.CSHARP,
             cs.SupportedLanguage.PHP,
         ],
     )

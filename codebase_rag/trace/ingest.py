@@ -1,0 +1,277 @@
+"""Ingest a runtime call trace into the graph as provenance-tagged CALLS edges.
+
+Records resolve to existing Function/Method/Module nodes; each resolved pair
+becomes one CALLS edge write. MERGE semantics collapse onto an existing static
+edge when there is one (the dynamic properties then decorate it), and create
+the edge when static analysis missed the relationship, in which case it is
+flagged ``static_missed``. Re-ingesting the same trace is idempotent: counts
+are SET, not incremented.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
+
+from loguru import logger
+
+from .. import constants as cs
+from ..cypher_queries import (
+    CYPHER_TRACE_CALLABLES,
+    CYPHER_TRACE_CONFIRM_CALLS,
+    CYPHER_TRACE_EXISTING_CALLS,
+)
+from ..services import IngestorProtocol, QueryProtocol
+from .dispatch_site import locate_dispatch_literal
+from .records import read_trace_file
+from .resolution import (
+    CallableNode,
+    DotnetFrameResolver,
+    FrameResolver,
+    JsFrameResolver,
+    JvmFrameResolver,
+    PhpFrameResolver,
+    ResolutionStats,
+)
+
+if TYPE_CHECKING:
+    from ..flow_verdict import QueryFn
+    from ..types_defs import PropertyDict, PropertyValue, ResultRow
+    from .records import FramePoint, TraceHeader
+    from .resolution import ResolvedFrame
+
+
+class FrameResolverProtocol(Protocol):
+    """Language-specific mapping of runtime frames to graph nodes."""
+
+    def resolve(
+        self, frame: FramePoint, stats: ResolutionStats
+    ) -> ResolvedFrame | None: ...
+
+
+def _resolver_for(
+    header: TraceHeader, repo_root: Path, nodes: list[CallableNode]
+) -> FrameResolverProtocol:
+    if header.language == cs.TRACE_LANGUAGE_JVM:
+        return JvmFrameResolver(nodes)
+    if header.language in (
+        cs.TRACE_LANGUAGE_JS,
+        cs.TRACE_LANGUAGE_LUA,
+        cs.TRACE_LANGUAGE_DART,
+        cs.TRACE_LANGUAGE_GO,
+        cs.TRACE_LANGUAGE_CPP,
+        cs.TRACE_LANGUAGE_RUST,
+    ):
+        # Lua-agent and Dart-collector frames share V8's shape: repo paths,
+        # bare runtime names, 1-based definition lines, <module>/<anonymous>
+        # markers. Rust pprof frames reduce to the same shape after demangling.
+        return JsFrameResolver(repo_root, nodes)
+    if header.language == cs.TRACE_LANGUAGE_DOTNET:
+        return DotnetFrameResolver(nodes)
+    if header.language == cs.TRACE_LANGUAGE_PHP:
+        return PhpFrameResolver(repo_root, nodes)
+    return FrameResolver(repo_root, nodes)
+
+
+class TraceGraphProtocol(IngestorProtocol, QueryProtocol, Protocol):
+    """A graph client that can both query nodes and write edges."""
+
+
+@dataclass(slots=True)
+class _EdgeStats:
+    count: int = 0
+    workloads: set[str] = field(default_factory=set)
+    receiver_types: set[str] = field(default_factory=set)
+
+
+@dataclass(slots=True)
+class TraceIngestSummary:
+    records: int = 0
+    edges: int = 0
+    confirmed_static: int = 0
+    static_missed: int = 0
+    resolution: ResolutionStats = field(default_factory=ResolutionStats)
+
+    @property
+    def unresolved(self) -> int:
+        return self.resolution.total
+
+
+def load_callables(fetch_all: QueryFn, project_prefix: str) -> list[CallableNode]:
+    """The Function/Method/Module nodes of one project, ready for resolution.
+
+    Shared with the crash-correlation query layer, which resolves traceback
+    frames against the same node shapes trace ingestion does.
+    """
+    rows: list[ResultRow] = fetch_all(
+        CYPHER_TRACE_CALLABLES, {cs.KEY_PREFIX: project_prefix}
+    )
+    nodes: list[CallableNode] = []
+    for row in rows:
+        label = row.get(cs.KEY_LABEL)
+        qualified_name = row.get(cs.KEY_QUALIFIED_NAME)
+        path = row.get(cs.KEY_PATH)
+        start_line = row.get(cs.KEY_START_LINE)
+        end_line = row.get(cs.KEY_END_LINE)
+        if (
+            not isinstance(label, str)
+            or not isinstance(qualified_name, str)
+            or not isinstance(path, str)
+        ):
+            continue
+        nodes.append(
+            CallableNode(
+                label=label,
+                qualified_name=qualified_name,
+                path=path,
+                start_line=start_line if isinstance(start_line, int) else None,
+                end_line=end_line if isinstance(end_line, int) else None,
+            )
+        )
+    return nodes
+
+
+def _load_existing_calls(
+    ingestor: TraceGraphProtocol, project_prefix: str
+) -> set[tuple[str, str]]:
+    rows = ingestor.fetch_all(
+        CYPHER_TRACE_EXISTING_CALLS, {cs.KEY_PREFIX: project_prefix}
+    )
+    pairs: set[tuple[str, str]] = set()
+    for row in rows:
+        from_qn = row.get(cs.KEY_FROM_QN)
+        to_qn = row.get(cs.KEY_TO_QN)
+        if isinstance(from_qn, str) and isinstance(to_qn, str):
+            pairs.add((from_qn, to_qn))
+    return pairs
+
+
+def _edge_properties(
+    stats: _EdgeStats, static_missed: bool, sampled: bool
+) -> dict[str, PropertyValue]:
+    workloads = sorted(stats.workloads)[: cs.TRACE_MAX_WORKLOADS_PER_EDGE]
+    receivers = sorted(stats.receiver_types)[: cs.TRACE_MAX_RECEIVER_TYPES_PER_EDGE]
+    return {
+        cs.TRACE_PROP_DYNAMIC: True,
+        cs.TRACE_PROP_CALL_COUNT: stats.count,
+        cs.TRACE_PROP_WORKLOAD_COUNT: len(stats.workloads),
+        cs.TRACE_PROP_WORKLOADS: workloads,
+        cs.TRACE_PROP_RECEIVER_TYPES: receivers,
+        cs.TRACE_PROP_STATIC_MISSED: static_missed,
+        cs.TRACE_PROP_SAMPLED: sampled,
+    }
+
+
+def ingest_trace(
+    trace_path: Path,
+    ingestor: TraceGraphProtocol,
+    repo_path: Path,
+    project_name: str,
+) -> TraceIngestSummary:
+    """Resolve ``trace_path`` against ``project_name``'s graph and write edges."""
+    header, records = read_trace_file(trace_path)
+    repo_root = repo_path.resolve() if repo_path else Path(header.repo_root)
+    project_prefix = project_name + cs.SEPARATOR_DOT
+
+    nodes = load_callables(ingestor.fetch_all, project_prefix)
+    callables_by_qn = {node.qualified_name: node for node in nodes}
+    existing = _load_existing_calls(ingestor, project_prefix)
+    resolver = _resolver_for(header, repo_root, nodes)
+
+    summary = TraceIngestSummary()
+    resolved_frames: dict[tuple[ResolvedFrame, ResolvedFrame], _EdgeStats] = {}
+    for record in records:
+        summary.records += 1
+        caller = resolver.resolve(record.caller, summary.resolution)
+        if caller is None:
+            continue
+        callee = resolver.resolve(record.callee, summary.resolution)
+        if callee is None:
+            continue
+        edge = resolved_frames.setdefault((caller, callee), _EdgeStats())
+        edge.count += record.count
+        edge.workloads.update(record.workloads)
+        edge.receiver_types.update(record.receiver_types)
+
+    for (caller, callee), stats in resolved_frames.items():
+        pair = (caller.qualified_name, callee.qualified_name)
+        static_missed = pair not in existing
+        properties = _edge_properties(stats, static_missed, header.sampled)
+        if static_missed:
+            summary.static_missed += 1
+            _mark_dynamic(
+                properties,
+                repo_root,
+                callables_by_qn.get(caller.qualified_name),
+                callee,
+            )
+        else:
+            summary.confirmed_static += 1
+            _confirm_static(ingestor, caller, callee, properties)
+        summary.edges += 1
+        ingestor.ensure_relationship_batch(
+            (caller.label, cs.KEY_QUALIFIED_NAME, caller.qualified_name),
+            cs.RelationshipType.CALLS,
+            (callee.label, cs.KEY_QUALIFIED_NAME, callee.qualified_name),
+            properties=properties,
+        )
+    ingestor.flush_all()
+    logger.info(
+        cs.TRACE_MSG_INGEST_SUMMARY.format(
+            records=summary.records,
+            edges=summary.edges,
+            confirmed=summary.confirmed_static,
+            missed=summary.static_missed,
+            unresolved=summary.unresolved,
+        )
+    )
+    return summary
+
+
+def _mark_dynamic(
+    properties: PropertyDict,
+    repo_root: Path,
+    caller_node: CallableNode | None,
+    callee: ResolvedFrame,
+) -> None:
+    """A call only the runtime saw: record the literal it dispatched through,
+    or say plainly that it cannot be located (issue #1526)."""
+    properties[cs.KEY_RESOLUTION] = cs.EdgeResolution.DYNAMIC
+    literal = None
+    if (
+        caller_node is not None
+        and caller_node.start_line is not None
+        and caller_node.end_line is not None
+    ):
+        literal = locate_dispatch_literal(
+            repo_root,
+            caller_node.path,
+            caller_node.start_line,
+            caller_node.end_line,
+            callee.qualified_name.rsplit(cs.SEPARATOR_DOT, 1)[-1],
+        )
+    if literal is None:
+        properties[cs.KEY_UNLOCATABLE] = True
+    else:
+        properties.update(literal)
+        properties[cs.KEY_DISPATCH_LITERAL] = True
+
+
+def _confirm_static(
+    ingestor: TraceGraphProtocol,
+    caller: ResolvedFrame,
+    callee: ResolvedFrame,
+    properties: PropertyDict,
+) -> None:
+    """Upgrade the pair's static edge(s) in place, on every site they have;
+    the trace decoration merges onto the site-less carrier as before."""
+    properties[cs.KEY_RESOLUTION] = cs.EdgeResolution.TRACE_CONFIRMED
+    ingestor.execute_write(
+        CYPHER_TRACE_CONFIRM_CALLS,
+        {
+            cs.KEY_FROM_QN: caller.qualified_name,
+            cs.KEY_TO_QN: callee.qualified_name,
+            cs.KEY_RESOLUTION: cs.EdgeResolution.TRACE_CONFIRMED,
+        },
+    )

@@ -19,7 +19,7 @@ from .expression_analyzer import PythonExpressionAnalyzerMixin
 from .variable_analyzer import PythonVariableAnalyzerMixin
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from ..factory import ASTCacheProtocol
     from ..js_ts import JsTypeInferenceEngine
@@ -43,6 +43,10 @@ class PythonTypeInferenceEngine(
         "_js_type_inference_getter",
         "_method_return_type_cache",
         "_type_inference_in_progress",
+        "_available_classes_cache",
+        "_return_stmt_cache",
+        "_self_assignment_cache",
+        "_class_member_type_cache",
     )
 
     def __init__(
@@ -52,7 +56,7 @@ class PythonTypeInferenceEngine(
         repo_path: Path,
         project_name: str,
         ast_cache: ASTCacheProtocol,
-        queries: dict[cs.SupportedLanguage, LanguageQueries],
+        queries: Mapping[cs.SupportedLanguage, LanguageQueries],
         module_qn_to_file_path: dict[str, Path],
         class_inheritance: dict[str, list[str]],
         simple_name_lookup: SimpleNameLookup,
@@ -71,6 +75,14 @@ class PythonTypeInferenceEngine(
 
         self._method_return_type_cache: dict[str, str | None] = {}
         self._type_inference_in_progress: set[str] = set()
+        self._available_classes_cache: dict[str, list[str]] = {}
+        # Keyed by the Node itself, never id(node): Node hashes by its tree-sitter
+        # identity, while a freed wrapper's id() is reused by unrelated nodes,
+        # producing stale hits that vary with memory layout (nondeterministic graphs,
+        # caught by the determinism test). Keys hold the node, so entries never collide.
+        self._return_stmt_cache: dict[Node, list] = {}
+        self._self_assignment_cache: dict[tuple[Node, str], dict[str, str] | None] = {}
+        self._class_member_type_cache: dict[str, dict[str, str]] = {}
 
     def build_local_variable_type_map(
         self, caller_node: Node, module_qn: str
@@ -79,8 +91,24 @@ class PythonTypeInferenceEngine(
 
         try:
             self._infer_parameter_types(caller_node, local_var_types, module_qn)
-            # (H) Single-pass traversal avoids O(5*N) multiple traversals for type inference.
-            self._traverse_single_pass(caller_node, local_var_types, module_qn)
+            # Single-pass traversal avoids O(5*N) traversals for type inference.
+            comprehensions, for_statements = self._traverse_single_pass(
+                caller_node, local_var_types, module_qn
+            )
+            self._infer_instance_attributes_from_init(
+                caller_node, local_var_types, module_qn
+            )
+            self._infer_property_return_types(caller_node, local_var_types, module_qn)
+            self._infer_class_annotation_types(caller_node, local_var_types, module_qn)
+            # Attribute-backed iterables (`for w in self.widgets`) only type
+            # after the attribute passes above populated `self.x`; re-running
+            # the loop analyzers picks them up (they never downgrade a type).
+            for comp in comprehensions:
+                self._analyze_comprehension(comp, local_var_types, module_qn)
+            for for_stmt in for_statements:
+                self._analyze_for_loop(for_stmt, local_var_types, module_qn)
+            aliases = self._collect_local_aliases(caller_node)
+            self._expand_chained_attribute_types(local_var_types, module_qn, aliases)
 
         except Exception as e:
             logger.debug(lg.PY_BUILD_VAR_MAP_FAILED, error=e)

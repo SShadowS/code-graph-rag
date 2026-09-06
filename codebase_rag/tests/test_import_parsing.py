@@ -43,30 +43,15 @@ class TestImportParsing:
     def test_python_import_parsing(self, graph_updater: GraphUpdater) -> None:
         """Test Python import statement parsing."""
 
-        import_patterns = [
-            "import os",
-            "import sys, json",
-            "from pathlib import Path",
-            "from collections import defaultdict, Counter",
-            "from . import local_module",
-            "from ..parent import something",
-        ]
-
-        for pattern in import_patterns:
-            try:
-                assert hasattr(
-                    graph_updater.factory.import_processor, "_parse_python_imports"
-                )
-                assert hasattr(
-                    graph_updater.factory.import_processor,
-                    "_handle_python_import_statement",
-                )
-                assert hasattr(
-                    graph_updater.factory.import_processor,
-                    "_handle_python_import_from_statement",
-                )
-            except Exception as e:
-                pytest.fail(f"Python import parsing failed for '{pattern}': {e}")
+        assert hasattr(graph_updater.factory.import_processor, "_parse_python_imports")
+        assert hasattr(
+            graph_updater.factory.import_processor,
+            "_handle_python_import_statement",
+        )
+        assert hasattr(
+            graph_updater.factory.import_processor,
+            "_handle_python_import_from_statement",
+        )
 
     def test_import_mapping_functionality(self, graph_updater: GraphUpdater) -> None:
         """Test that import mapping works correctly."""
@@ -107,13 +92,10 @@ class TestImportParsing:
             graph_updater.factory.import_processor, "_resolve_relative_import"
         )
 
-        try:
-            method = getattr(
-                graph_updater.factory.import_processor, "_resolve_relative_import"
-            )
-            assert callable(method)
-        except Exception as e:
-            pytest.fail(f"Relative import resolution method check failed: {e}")
+        method = getattr(
+            graph_updater.factory.import_processor, "_resolve_relative_import"
+        )
+        assert callable(method)
 
     def test_language_specific_import_methods(
         self, graph_updater: GraphUpdater
@@ -146,15 +128,10 @@ class TestImportParsing:
         graph_updater.function_registry = FunctionRegistryTrie()
         assert len(graph_updater.function_registry) == 0
 
-        try:
-            result = (
-                graph_updater.factory.call_processor._resolver.resolve_function_call(
-                    "nonexistent", module_qn
-                )
-            )
-            assert result is None
-        except Exception as e:
-            pytest.fail(f"Function resolution crashed unexpectedly: {e}")
+        result = graph_updater.factory.call_processor._resolver.resolve_function_call(
+            "nonexistent", module_qn
+        )
+        assert result is None
 
     def test_python_alias_import_parsing(self) -> None:
         PY_LANGUAGE = Language(tsp.language())
@@ -285,7 +262,6 @@ class TestExternalModuleNodeCreation:
 
         module_path = processor._resolve_module_path(
             full_name="java.util.List",
-            module_qn="test_project.main.Main",
             language=cs.SupportedLanguage.JAVA,
         )
 
@@ -293,7 +269,7 @@ class TestExternalModuleNodeCreation:
 
         assert len(mock_ingestor.nodes_created) == 1
         label, props = mock_ingestor.nodes_created[0]
-        assert label == cs.NodeLabel.MODULE
+        assert label == cs.NodeLabel.EXTERNAL_MODULE
         assert props[cs.KEY_QUALIFIED_NAME] == "java.util"
         assert props[cs.KEY_NAME] == "util", (
             f"Expected name='util' (last part of module_path), got name='{props[cs.KEY_NAME]}'"
@@ -311,13 +287,12 @@ class TestExternalModuleNodeCreation:
 
         module_path = processor._resolve_rust_import_path(
             import_path="std::collections::HashMap",
-            module_qn="test_project.src.main",
         )
 
         assert module_path == "std::collections"
         assert len(mock_ingestor.nodes_created) == 1
         label, props = mock_ingestor.nodes_created[0]
-        assert label == cs.NodeLabel.MODULE
+        assert label == cs.NodeLabel.EXTERNAL_MODULE
         assert props[cs.KEY_QUALIFIED_NAME] == "std::collections"
 
     def test_rust_external_module_name_uses_module_path(
@@ -334,7 +309,6 @@ class TestExternalModuleNodeCreation:
 
         module_path = processor._resolve_rust_import_path(
             import_path="std::collections::HashMap",
-            module_qn="test_project.src.main",
         )
 
         assert module_path == "std::collections"
@@ -344,38 +318,49 @@ class TestExternalModuleNodeCreation:
 
 
 class TestRustCrateResolution:
-    def test_crate_import_from_nested_module_resolves_to_crate_root(self) -> None:
+    def test_crate_import_from_nested_module_resolves_to_crate_root(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "src" / "subdir").mkdir(parents=True)
+        (tmp_path / "src" / "lib.rs").touch()
+        (tmp_path / "src" / "utils.rs").touch()
         processor = ImportProcessor(
-            repo_path=Path("/tmp/test_project"),
+            repo_path=tmp_path,
             project_name="test_project",
             ingestor=None,
             function_registry=None,
         )
 
-        result = processor._resolve_rust_import_path(
-            import_path="crate::utils::helper",
+        result = processor._rewrite_rust_local_use_path(
+            "crate::utils::helper",
             module_qn="test_project.src.subdir.nested",
         )
 
-        assert result == "test_project.src.utils", (
-            f"crate:: should resolve relative to crate root (src), not parent module. "
-            f"Got {result}, expected test_project.src.utils"
+        assert result == "test_project.src.utils.helper", (
+            f"crate:: should resolve relative to the crate root (src), not the "
+            f"parent module. Got {result}"
         )
 
-    def test_crate_import_from_flat_module_resolves_correctly(self) -> None:
+    def test_crate_import_without_src_dir_resolves_to_entry_point_dir(
+        self, tmp_path: Path
+    ) -> None:
+        # ripgrep's core crate layout: the entry point is crates/core/main.rs
+        # and there is no src directory (issue #1007).
+        (tmp_path / "crates" / "core" / "flags").mkdir(parents=True)
+        (tmp_path / "crates" / "core" / "main.rs").touch()
         processor = ImportProcessor(
-            repo_path=Path("/tmp/test_project"),
+            repo_path=tmp_path,
             project_name="test_project",
             ingestor=None,
             function_registry=None,
         )
 
-        result = processor._resolve_rust_import_path(
-            import_path="crate::utils::helper",
-            module_qn="test_project.src.main",
+        result = processor._rewrite_rust_local_use_path(
+            "crate::flags::Flag",
+            module_qn="test_project.crates.core.flags.defs",
         )
 
-        assert result == "test_project.src.utils"
+        assert result == "test_project.crates.core.flags.Flag"
 
 
 class TestJsInternalModuleResolution:
@@ -448,7 +433,6 @@ class TestProjectPrefixMatching:
 
         result = processor._resolve_module_path(
             full_name="myapp_v2.utils.Helper",
-            module_qn="myapp.main.Main",
             language=cs.SupportedLanguage.JAVA,
         )
 
@@ -469,7 +453,6 @@ class TestProjectPrefixMatching:
 
         result = processor._resolve_module_path(
             full_name="myapp.utils.Helper",
-            module_qn="myapp.main.Main",
             language=cs.SupportedLanguage.JAVA,
         )
 
@@ -549,7 +532,7 @@ class TestIsLocalModuleCache:
         processor._is_local_java_import("com.example.Service")
         processor._is_local_java_import("com.example.Service")
 
-        info = processor._is_local_java_import_cached.cache_info()
+        info = processor._java_source_root_prefix_cached.cache_info()
         assert info.hits >= 2
         assert info.misses == 1
 

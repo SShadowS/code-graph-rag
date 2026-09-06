@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from abc import abstractmethod
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from loguru import logger
 
 from ... import constants as cs
 from ... import logs as ls
+from ...decorators import recursion_guard
 from ...types_defs import ASTNode
 from ..utils import safe_decode_text
 from .utils import (
@@ -22,12 +24,44 @@ if TYPE_CHECKING:
     from ...types_defs import ASTCacheProtocol
 
 
+def _java_literal_type(expr_node: ASTNode) -> str | None:
+    # A literal's type is fixed by its node type, and for the numeric ones by
+    # its suffix: `1L` is a long, `1.5f` a float.
+    node_type = expr_node.type
+    if node_type == cs.TS_STRING_LITERAL:
+        return cs.JAVA_TYPE_STRING
+    if node_type == cs.TS_JAVA_CHARACTER_LITERAL:
+        return cs.JAVA_TYPE_CHAR
+    if node_type in (cs.TS_TRUE, cs.TS_FALSE):
+        return cs.JAVA_TYPE_BOOLEAN
+    text = safe_decode_text(expr_node) or ""
+    if node_type in cs.TS_JAVA_FLOATING_POINT_LITERALS:
+        return (
+            cs.JAVA_TYPE_FLOAT
+            if text.endswith(cs.JAVA_FLOAT_SUFFIXES)
+            else cs.JAVA_TYPE_DOUBLE
+        )
+    if node_type in cs.TS_JAVA_INTEGER_LITERALS:
+        return (
+            cs.JAVA_TYPE_LONG_PRIMITIVE
+            if text.endswith(cs.JAVA_LONG_SUFFIXES)
+            else cs.JAVA_TYPE_INT
+        )
+    return None
+
+
 class JavaVariableAnalyzerMixin:
     __slots__ = ()
     ast_cache: ASTCacheProtocol
     module_qn_to_file_path: dict[str, Path]
+    class_inheritance: dict[str, list[str]]
     _lookup_cache: dict[str, str | None]
     _lookup_in_progress: set[str]
+    # Annotation only, never a def: this mixin precedes JavaMethodResolverMixin
+    # in the MRO, so even an @abstractmethod stub here would SHADOW the real
+    # implementation and silently resolve every call to None.
+    _do_resolve_java_method_call: Callable[..., tuple[str, str] | None]
+    _declared_return_type_of: Callable[[str], str | None]
 
     @abstractmethod
     def _resolve_java_type_name(self, type_name: str, module_qn: str) -> str: ...
@@ -106,19 +140,32 @@ class JavaVariableAnalyzerMixin:
             local_var_types[param_name] = resolved_type
             logger.debug(ls.JAVA_VARARGS_PARAM, name=param_name, type=resolved_type)
 
+    def _traverse_for(
+        self,
+        node: ASTNode,
+        node_type: str,
+        process: Callable[[ASTNode, dict[str, str], str], None],
+        local_var_types: dict[str, str],
+        module_qn: str,
+    ) -> None:
+        # One walker for every "find nodes of type T under this scope and feed
+        # them to a processor" pass; the passes differ only in (T, processor).
+        if node.type == node_type:
+            process(node, local_var_types, module_qn)
+
+        for child in node.children:
+            self._traverse_for(child, node_type, process, local_var_types, module_qn)
+
     def _analyze_java_local_variables(
         self, scope_node: ASTNode, local_var_types: dict[str, str], module_qn: str
     ) -> None:
-        self._traverse_for_local_variables(scope_node, local_var_types, module_qn)
-
-    def _traverse_for_local_variables(
-        self, node: ASTNode, local_var_types: dict[str, str], module_qn: str
-    ) -> None:
-        if node.type == cs.TS_LOCAL_VARIABLE_DECLARATION:
-            self._process_java_variable_declaration(node, local_var_types, module_qn)
-
-        for child in node.children:
-            self._traverse_for_local_variables(child, local_var_types, module_qn)
+        self._traverse_for(
+            scope_node,
+            cs.TS_LOCAL_VARIABLE_DECLARATION,
+            self._process_java_variable_declaration,
+            local_var_types,
+            module_qn,
+        )
 
     def _process_java_variable_declaration(
         self, decl_node: ASTNode, local_var_types: dict[str, str], module_qn: str
@@ -158,7 +205,7 @@ class JavaVariableAnalyzerMixin:
 
         if value_node := declarator_node.child_by_field_name(cs.FIELD_VALUE):
             if inferred_type := self._infer_java_type_from_expression(
-                value_node, module_qn
+                value_node, module_qn, local_var_types
             ):
                 resolved_type = self._resolve_java_type_name(inferred_type, module_qn)
                 local_var_types[var_name] = resolved_type
@@ -204,16 +251,13 @@ class JavaVariableAnalyzerMixin:
     def _analyze_java_constructor_assignments(
         self, scope_node: ASTNode, local_var_types: dict[str, str], module_qn: str
     ) -> None:
-        self._traverse_for_assignments(scope_node, local_var_types, module_qn)
-
-    def _traverse_for_assignments(
-        self, node: ASTNode, local_var_types: dict[str, str], module_qn: str
-    ) -> None:
-        if node.type == cs.TS_ASSIGNMENT_EXPRESSION:
-            self._process_java_assignment(node, local_var_types, module_qn)
-
-        for child in node.children:
-            self._traverse_for_assignments(child, local_var_types, module_qn)
+        self._traverse_for(
+            scope_node,
+            cs.TS_ASSIGNMENT_EXPRESSION,
+            self._process_java_assignment,
+            local_var_types,
+            module_qn,
+        )
 
     def _process_java_assignment(
         self, assignment_node: ASTNode, local_var_types: dict[str, str], module_qn: str
@@ -228,7 +272,7 @@ class JavaVariableAnalyzerMixin:
             return
 
         if inferred_type := self._infer_java_type_from_expression(
-            right_node, module_qn
+            right_node, module_qn, local_var_types
         ):
             resolved_type = self._resolve_java_type_name(inferred_type, module_qn)
             local_var_types[var_name] = resolved_type
@@ -248,24 +292,19 @@ class JavaVariableAnalyzerMixin:
 
                     if object_name and field_name:
                         return f"{object_name}{cs.SEPARATOR_DOT}{field_name}"
-            case _:
-                pass
 
         return None
 
     def _analyze_java_enhanced_for_loops(
         self, scope_node: ASTNode, local_var_types: dict[str, str], module_qn: str
     ) -> None:
-        self._traverse_for_enhanced_for_loops(scope_node, local_var_types, module_qn)
-
-    def _traverse_for_enhanced_for_loops(
-        self, node: ASTNode, local_var_types: dict[str, str], module_qn: str
-    ) -> None:
-        if node.type == cs.TS_ENHANCED_FOR_STATEMENT:
-            self._process_enhanced_for_statement(node, local_var_types, module_qn)
-
-        for child in node.children:
-            self._traverse_for_enhanced_for_loops(child, local_var_types, module_qn)
+        self._traverse_for(
+            scope_node,
+            cs.TS_ENHANCED_FOR_STATEMENT,
+            self._process_enhanced_for_statement,
+            local_var_types,
+            module_qn,
+        )
 
     def _process_enhanced_for_statement(
         self, for_node: ASTNode, local_var_types: dict[str, str], module_qn: str
@@ -327,47 +366,52 @@ class JavaVariableAnalyzerMixin:
                         break
 
     def _infer_java_type_from_expression(
-        self, expr_node: ASTNode, module_qn: str
+        self,
+        expr_node: ASTNode,
+        module_qn: str,
+        local_var_types: dict[str, str] | None = None,
     ) -> str | None:
+        # Literals carry their type in the node itself, with no lookup and no
+        # scope: keeping them out of this switch keeps it readable.
+        if (literal := _java_literal_type(expr_node)) is not None:
+            return literal
+
         match expr_node.type:
             case cs.TS_OBJECT_CREATION_EXPRESSION:
                 if type_node := expr_node.child_by_field_name(cs.FIELD_TYPE):
                     return safe_decode_text(type_node)
 
             case cs.TS_METHOD_INVOCATION:
-                return self._infer_java_method_return_type(expr_node, module_qn)
+                return self._infer_java_method_return_type(
+                    expr_node, module_qn, local_var_types
+                )
 
             case cs.TS_IDENTIFIER:
                 if var_name := safe_decode_text(expr_node):
+                    # The caller's own locals first: the module-wide lookup is
+                    # name-keyed across every method, so a same-named local in
+                    # another method would answer for this one (issue #1348).
+                    if local_var_types and var_name in local_var_types:
+                        return local_var_types[var_name]
                     return self._lookup_variable_type(var_name, module_qn)
 
             case cs.TS_FIELD_ACCESS:
-                return self._infer_java_field_access_type(expr_node, module_qn)
-
-            case cs.TS_STRING_LITERAL:
-                return cs.JAVA_TYPE_STRING
-
-            case cs.TS_INTEGER_LITERAL:
-                return cs.JAVA_TYPE_INT
-
-            case cs.TS_DECIMAL_FLOATING_POINT_LITERAL:
-                return cs.JAVA_TYPE_DOUBLE
-
-            case cs.TS_TRUE | cs.TS_FALSE:
-                return cs.JAVA_TYPE_BOOLEAN
+                return self._infer_java_field_access_type(
+                    expr_node, module_qn, local_var_types
+                )
 
             case cs.TS_ARRAY_CREATION_EXPRESSION:
                 if type_node := expr_node.child_by_field_name(cs.FIELD_TYPE):
                     if base_type := safe_decode_text(type_node):
                         return f"{base_type}{cs.JAVA_ARRAY_SUFFIX}"
 
-            case _:
-                pass
-
         return None
 
     def _infer_java_method_return_type(
-        self, method_call_node: ASTNode, module_qn: str
+        self,
+        method_call_node: ASTNode,
+        module_qn: str,
+        local_var_types: dict[str, str] | None = None,
     ) -> str | None:
         call_info = extract_method_call_info(method_call_node)
         if not call_info:
@@ -377,6 +421,19 @@ class JavaVariableAnalyzerMixin:
         if not method_name:
             return None
 
+        # Resolve the nested call properly first: it is overload-sensitive, and
+        # the name-only lookup below takes the FIRST declaration's return type,
+        # so `take(make("x"))` could be typed from `make(int)`. The resolved qn
+        # carries the SELECTED signature, which reads back the right return
+        # type. Needs the caller's variable types, or the receiver of an
+        # instance call cannot be typed (issue #1348).
+        if (
+            resolved := self._resolve_nested_java_call(
+                method_call_node, module_qn, local_var_types or {}
+            )
+        ) and (declared := self._declared_return_type_of(resolved[1])):
+            return declared
+
         object_ref = call_info[cs.FIELD_OBJECT]
         call_string = (
             f"{object_ref}{cs.SEPARATOR_DOT}{method_name}"
@@ -385,8 +442,26 @@ class JavaVariableAnalyzerMixin:
         )
         return self._resolve_java_method_return_type(call_string, module_qn)
 
+    @recursion_guard(
+        key_func=lambda self, call_node, *_, **__: call_node.id,
+        guard_name=cs.GUARD_NESTED_JAVA_CALL,
+    )
+    def _resolve_nested_java_call(
+        self,
+        call_node: ASTNode,
+        module_qn: str,
+        local_var_types: dict[str, str],
+    ) -> tuple[str, str] | None:
+        # Guarded: resolution infers its ARGUMENT types, and typing an argument
+        # comes back here, so a call nested in its own argument list would
+        # recurse without a brake.
+        return self._do_resolve_java_method_call(call_node, local_var_types, module_qn)
+
     def _infer_java_field_access_type(
-        self, field_access_node: ASTNode, module_qn: str
+        self,
+        field_access_node: ASTNode,
+        module_qn: str,
+        local_var_types: dict[str, str] | None = None,
     ) -> str | None:
         object_node = field_access_node.child_by_field_name(cs.FIELD_OBJECT)
         field_node = field_access_node.child_by_field_name(cs.FIELD_FIELD)
@@ -394,21 +469,66 @@ class JavaVariableAnalyzerMixin:
         if not object_node or not field_node:
             return None
 
-        object_name = safe_decode_text(object_node)
         field_name = safe_decode_text(field_node)
-
-        if not object_name or not field_name:
+        if not field_name:
             return None
 
-        if object_type := self._lookup_variable_type(object_name, module_qn):
+        # A nested receiver (`obj.address.zipCode`) has a field_access as its object;
+        # recurse to infer that inner type before the outer field, so multi-level
+        # access resolves instead of failing on a non-variable name.
+        if object_node.type == cs.TS_FIELD_ACCESS:
+            object_type = self._infer_java_field_access_type(
+                object_node, module_qn, local_var_types
+            )
+        elif object_name := safe_decode_text(object_node):
+            object_type = self._resolve_field_access_base_type(
+                object_name, field_access_node, module_qn, local_var_types
+            )
+        else:
+            object_type = None
+
+        if object_type:
             return self._lookup_java_field_type(object_type, field_name, module_qn)
         return None
+
+    def _resolve_field_access_base_type(
+        self,
+        object_name: str,
+        field_access_node: ASTNode,
+        module_qn: str,
+        local_var_types: dict[str, str] | None = None,
+    ) -> str | None:
+        # The caller's own locals win over the module-wide, name-keyed map,
+        # which cannot tell two methods' same-named variables apart.
+        if local_var_types and object_name in local_var_types:
+            return local_var_types[object_name]
+        # `this`/`super` are receiver keywords, not variables: resolve them to the
+        # containing class or its superclass so nested chains rooted at them
+        # (e.g. `var c = this.address.city`) infer a type.
+        if object_name in (cs.JAVA_KEYWORD_THIS, cs.JAVA_KEYWORD_SUPER):
+            if not (class_node := self._find_containing_java_class(field_access_node)):
+                return None
+            class_info = extract_class_info(class_node)
+            class_name = class_info.get(cs.FIELD_NAME)
+            if object_name == cs.JAVA_KEYWORD_THIS:
+                return class_name
+            # `super`: return the fully-qualified parent from class_inheritance so a
+            # nested superclass (`Outer.Base`) resolves; the AST's relative name
+            # would be treated as an absolute class key by the field lookup.
+            if class_name:
+                own_qn = self._resolve_java_type_name(class_name, module_qn)
+                if cs.SEPARATOR_DOT not in own_qn:
+                    own_qn = f"{module_qn}{cs.SEPARATOR_DOT}{own_qn}"
+                if parents := self.class_inheritance.get(own_qn):
+                    return parents[0]
+            return class_info.get(cs.FIELD_SUPERCLASS)
+        return self._lookup_variable_type(object_name, module_qn)
 
     def _lookup_variable_type(self, var_name: str, module_qn: str) -> str | None:
         if not var_name or not module_qn:
             return None
 
-        cache_key = f"{module_qn}{cs.SEPARATOR_COLON}{var_name}"
+        cache_key = f"{module_qn}{cs.CHAR_COLON}{var_name}"
         if cache_key in self._lookup_cache:
             return self._lookup_cache[cache_key]
 
@@ -443,45 +563,82 @@ class JavaVariableAnalyzerMixin:
         if not class_type or not field_name:
             return None
 
-        resolved_class_type = self._resolve_java_type_name(class_type, module_qn)
-
-        class_qn = (
-            resolved_class_type
-            if cs.SEPARATOR_DOT in resolved_class_type
-            else f"{module_qn}{cs.SEPARATOR_DOT}{resolved_class_type}"
+        resolved = self._resolve_java_type_name(class_type, module_qn)
+        class_qn: str | None = (
+            resolved
+            if cs.SEPARATOR_DOT in resolved
+            else f"{module_qn}{cs.SEPARATOR_DOT}{resolved}"
         )
 
+        # Walk the inheritance chain via qualified parents from class_inheritance:
+        # a field accessed on a subclass may be declared on a superclass, including
+        # a nested one like `Outer.Base`. Seen-guarded.
+        seen: set[str] = set()
+        while class_qn and class_qn not in seen:
+            seen.add(class_qn)
+            if located := self._locate_class(class_qn):
+                root_node, class_path, target_module_qn = located
+                if field_type := self._find_field_type_in_nested_class(
+                    root_node, class_path, field_name, target_module_qn
+                ):
+                    return field_type
+            parents = self.class_inheritance.get(class_qn)
+            class_qn = parents[0] if parents else None
+
+        return None
+
+    def _locate_class(self, class_qn: str) -> tuple[ASTNode, list[str], str] | None:
+        # The file module is the longest registered prefix of the class qn; the rest
+        # are the (possibly nested) class path within it, so `proj.pkg.Outer.Base`
+        # resolves to file `proj.pkg` + path [Outer, Base].
         parts = class_qn.split(cs.SEPARATOR_DOT)
-        if len(parts) < 2:
-            return None
-
-        target_module_qn = cs.SEPARATOR_DOT.join(parts[:-1])
-        target_class_name = parts[-1]
-
-        file_path = self.module_qn_to_file_path.get(target_module_qn)
-        if file_path is None or file_path not in self.ast_cache:
-            return None
-
-        root_node, _ = self.ast_cache[file_path]
-
-        return self._find_field_type_in_class(
-            root_node, target_class_name, field_name, target_module_qn
-        )
+        for split in range(len(parts) - 1, 0, -1):
+            module_candidate = cs.SEPARATOR_DOT.join(parts[:split])
+            file_path = self.module_qn_to_file_path.get(module_candidate)
+            if file_path is not None and (entry := self.ast_cache.load(file_path)):
+                root_node, _ = entry
+                return root_node, parts[split:], module_candidate
+        return None
 
     def _find_field_type_in_class(
         self, root_node: ASTNode, class_name: str, field_name: str, module_qn: str
     ) -> str | None:
-        for child in root_node.children:
-            if child.type == cs.TS_CLASS_DECLARATION:
-                class_info = extract_class_info(child)
-                if class_info.get(cs.FIELD_NAME) == class_name:
-                    if class_body := child.child_by_field_name(cs.FIELD_BODY):
-                        for field_child in class_body.children:
-                            if field_child.type == cs.TS_FIELD_DECLARATION:
-                                field_info = extract_field_info(field_child)
-                                if field_info.get(cs.FIELD_NAME) == field_name:
-                                    if field_type := field_info.get(cs.FIELD_TYPE):
-                                        return self._resolve_java_type_name(
-                                            str(field_type), module_qn
-                                        )
+        return self._find_field_type_in_nested_class(
+            root_node, [class_name], field_name, module_qn
+        )
+
+    def _find_field_type_in_nested_class(
+        self,
+        root_node: ASTNode,
+        class_path: list[str],
+        field_name: str,
+        module_qn: str,
+    ) -> str | None:
+        children = root_node.children
+        body: ASTNode | None = None
+        for class_name in class_path:
+            class_node = next(
+                (
+                    child
+                    for child in children
+                    if child.type == cs.TS_CLASS_DECLARATION
+                    and extract_class_info(child).get(cs.FIELD_NAME) == class_name
+                ),
+                None,
+            )
+            if class_node is None or not (
+                body := class_node.child_by_field_name(cs.FIELD_BODY)
+            ):
+                return None
+            children = body.children
+
+        if body is None:
+            return None
+
+        for field_child in body.children:
+            if field_child.type == cs.TS_FIELD_DECLARATION:
+                field_info = extract_field_info(field_child)
+                if field_info.get(cs.FIELD_NAME) == field_name:
+                    if field_type := field_info.get(cs.FIELD_TYPE):
+                        return self._resolve_java_type_name(str(field_type), module_qn)
         return None

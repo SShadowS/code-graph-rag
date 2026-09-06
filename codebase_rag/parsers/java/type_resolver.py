@@ -18,6 +18,10 @@ if TYPE_CHECKING:
     from ...types_defs import ASTCacheProtocol, FunctionRegistryTrieProtocol
     from ..import_processor import ImportProcessor
 
+# Node types an imported Java name can declare (records and annotation types
+# register as CLASS).
+_JAVA_TYPE_DECL_NODE_TYPES = (NodeType.CLASS, NodeType.INTERFACE, NodeType.ENUM)
+
 
 class JavaTypeResolverMixin:
     __slots__ = ()
@@ -101,6 +105,27 @@ class JavaTypeResolverMixin:
 
         return []
 
+    def _imported_class_qn(self, target: str, type_name: str) -> str:
+        # A LOCAL Java import is recorded as the imported file's MODULE qn
+        # (repo.com.foo.util.Helper), but the registered class qn duplicates the
+        # class segment (repo.com.foo.util.Helper.Helper); the raw target then
+        # dead-ends because the project prefix also disables the fqn-map fallback.
+        # Append the imported simple name when THAT is the registered class.
+        # Registry-guarded, so targets already class qns and external fqns pass
+        # through unchanged.
+        if (
+            target in self.function_registry
+            and self.function_registry[target] in _JAVA_TYPE_DECL_NODE_TYPES
+        ):
+            return target
+        class_qn = f"{target}{cs.SEPARATOR_DOT}{type_name}"
+        if (
+            class_qn in self.function_registry
+            and self.function_registry[class_qn] in _JAVA_TYPE_DECL_NODE_TYPES
+        ):
+            return class_qn
+        return target
+
     def _resolve_java_type_name(self, type_name: str, module_qn: str) -> str:
         if not type_name:
             return cs.JAVA_TYPE_OBJECT
@@ -120,19 +145,37 @@ class JavaTypeResolverMixin:
             return f"{resolved_base}{cs.JAVA_ARRAY_SUFFIX}"
 
         if cs.CHAR_ANGLE_OPEN in type_name and cs.CHAR_ANGLE_CLOSE in type_name:
-            base_type = type_name.split(cs.CHAR_ANGLE_OPEN)[0]
+            base_type = type_name.split(cs.CHAR_ANGLE_OPEN, maxsplit=1)[0]
             return self._resolve_java_type_name(base_type, module_qn)
 
         if module_qn in self.import_processor.import_mapping:
             import_map = self.import_processor.import_mapping[module_qn]
             if type_name in import_map:
-                return import_map[type_name]
+                return self._imported_class_qn(import_map[type_name], type_name)
 
         same_package_qn = f"{module_qn}{cs.SEPARATOR_DOT}{type_name}"
         if same_package_qn in self.function_registry and self.function_registry[
             same_package_qn
         ] in [NodeType.CLASS, NodeType.INTERFACE]:
             return same_package_qn
+
+        # A nested class referenced by its simple name from within the same file
+        # (`RECORD_HELPER` typed by the nested `RecordHelper`): the qn is
+        # `module.Outer.Nested`, not `module.Nested`, so the direct check above
+        # misses it. Search only this module's trie subtree (bounded, not a
+        # whole-registry scan) for a CLASS/INTERFACE whose last segment is the simple
+        # name, used only when unambiguous so a same-named nested type elsewhere
+        # cannot mis-resolve. The trie indexes by dot segment, so find_with_prefix
+        # already excludes character-level prefix collisions.
+        suffix = f"{cs.SEPARATOR_DOT}{type_name}"
+        nested = [
+            qn
+            for qn, entity_type in self.function_registry.find_with_prefix(module_qn)
+            if qn.endswith(suffix)
+            and entity_type in (NodeType.CLASS, NodeType.INTERFACE)
+        ]
+        if len(nested) == 1:
+            return nested[0]
 
         return type_name
 
@@ -187,10 +230,10 @@ class JavaTypeResolverMixin:
         target_class_name = parts[-1]
 
         file_path = self.module_qn_to_file_path.get(module_qn)
-        if file_path is None or file_path not in self.ast_cache:
+        if file_path is None or not (entry := self.ast_cache.load(file_path)):
             return []
 
-        root_node, _ = self.ast_cache[file_path]
+        root_node, _ = entry
 
         return self._find_interfaces_using_ast(root_node, target_class_name, module_qn)
 
@@ -254,8 +297,6 @@ class JavaTypeResolverMixin:
                     class_name := safe_decode_text(name_node)
                 ):
                     class_names.append(class_name)
-            case _:
-                pass
 
         for child in node.children:
             self._traverse_for_class_declarations(child, class_names)

@@ -5,11 +5,13 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic_ai.usage import RunUsage
 
 from codebase_rag import constants as cs
 from codebase_rag import exceptions as ex
 from codebase_rag.config import ModelConfig
 from codebase_rag.main import _create_model_from_string, _handle_model_command
+from codebase_rag.models import SessionState
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -171,11 +173,15 @@ class TestModelOverrideInAgentLoop:
         mock_response = MagicMock()
         mock_response.output = "Test response"
         mock_response.new_messages.return_value = []
+        mock_response.usage = RunUsage(input_tokens=0, output_tokens=0)
         mock_agent.run = AsyncMock(return_value=mock_response)
 
         mock_model = MagicMock()
         tool_names = ConfirmationToolNames(
-            replace_code="replace", create_file="create", shell_command="shell"
+            replace_code="replace",
+            create_file="create",
+            shell_command="shell",
+            structural_replace="structural_replace",
         )
 
         with (
@@ -185,6 +191,7 @@ class TestModelOverrideInAgentLoop:
             mock_ctx.console.status.return_value.__enter__ = MagicMock()
             mock_ctx.console.status.return_value.__exit__ = MagicMock()
             mock_ctx.console.print = MagicMock()
+            mock_ctx.session = SessionState()
 
             await _run_agent_response_loop(
                 mock_agent,
@@ -208,10 +215,14 @@ class TestModelOverrideInAgentLoop:
         mock_response = MagicMock()
         mock_response.output = "Test response"
         mock_response.new_messages.return_value = []
+        mock_response.usage = RunUsage(input_tokens=0, output_tokens=0)
         mock_agent.run = AsyncMock(return_value=mock_response)
 
         tool_names = ConfirmationToolNames(
-            replace_code="replace", create_file="create", shell_command="shell"
+            replace_code="replace",
+            create_file="create",
+            shell_command="shell",
+            structural_replace="structural_replace",
         )
 
         with (
@@ -221,6 +232,7 @@ class TestModelOverrideInAgentLoop:
             mock_ctx.console.status.return_value.__enter__ = MagicMock()
             mock_ctx.console.status.return_value.__exit__ = MagicMock()
             mock_ctx.console.print = MagicMock()
+            mock_ctx.session = SessionState()
 
             await _run_agent_response_loop(
                 mock_agent,
@@ -233,6 +245,217 @@ class TestModelOverrideInAgentLoop:
             mock_agent.run.assert_called_once()
             _, kwargs = mock_agent.run.call_args
             assert kwargs.get("model") is None
+
+
+class TestAgentLoopUserPromptOnResume:
+    @staticmethod
+    def _make_response(output: object) -> MagicMock:
+        response = MagicMock()
+        response.output = output
+        response.new_messages.return_value = []
+        response.usage = RunUsage(input_tokens=0, output_tokens=0)
+        return response
+
+    @staticmethod
+    def _patches():
+        from pydantic_ai import DeferredToolResults
+
+        return (
+            patch("codebase_rag.main.app_context"),
+            patch("codebase_rag.main.log_session_event"),
+            patch(
+                "codebase_rag.main._process_tool_approvals",
+                new=AsyncMock(return_value=DeferredToolResults()),
+            ),
+            patch("codebase_rag.main._refresh_context_tokens", new=AsyncMock()),
+            patch("codebase_rag.main._thinking_with_status_bar"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_user_prompt_not_resent_after_deferred_tool_approval(self) -> None:
+        from pydantic_ai import DeferredToolRequests
+
+        from codebase_rag.main import _run_agent_response_loop
+        from codebase_rag.types_defs import CHAT_LOOP_UI, ConfirmationToolNames
+
+        mock_agent = MagicMock()
+        mock_agent.run = AsyncMock(
+            side_effect=[
+                self._make_response(DeferredToolRequests(approvals=[])),
+                self._make_response("Done"),
+            ]
+        )
+        tool_names = ConfirmationToolNames(
+            replace_code="replace",
+            create_file="create",
+            shell_command="shell",
+            structural_replace="structural_replace",
+        )
+        ctx, log_evt, approvals, refresh, status = self._patches()
+
+        with ctx as mock_ctx, log_evt, approvals, refresh, status:
+            mock_ctx.console.print = MagicMock()
+            mock_ctx.session = SessionState()
+
+            await _run_agent_response_loop(
+                mock_agent,
+                [],
+                "delete first and add two",
+                CHAT_LOOP_UI,
+                tool_names,
+            )
+
+        assert mock_agent.run.call_count == 2
+        assert mock_agent.run.call_args_list[0][0][0] == "delete first and add two"
+        assert mock_agent.run.call_args_list[1][0][0] is None
+
+    @pytest.mark.asyncio
+    async def test_user_prompt_not_resent_across_multiple_deferred_rounds(
+        self,
+    ) -> None:
+        from pydantic_ai import DeferredToolRequests
+
+        from codebase_rag.main import _run_agent_response_loop
+        from codebase_rag.types_defs import CHAT_LOOP_UI, ConfirmationToolNames
+
+        mock_agent = MagicMock()
+        mock_agent.run = AsyncMock(
+            side_effect=[
+                self._make_response(DeferredToolRequests(approvals=[])),
+                self._make_response(DeferredToolRequests(approvals=[])),
+                self._make_response(DeferredToolRequests(approvals=[])),
+                self._make_response("All done"),
+            ]
+        )
+        tool_names = ConfirmationToolNames(
+            replace_code="replace",
+            create_file="create",
+            shell_command="shell",
+            structural_replace="structural_replace",
+        )
+        ctx, log_evt, approvals, refresh, status = self._patches()
+
+        with ctx as mock_ctx, log_evt, approvals, refresh, status:
+            mock_ctx.console.print = MagicMock()
+            mock_ctx.session = SessionState()
+
+            await _run_agent_response_loop(
+                mock_agent, [], "multi-step task", CHAT_LOOP_UI, tool_names
+            )
+
+        assert mock_agent.run.call_count == 4
+        assert mock_agent.run.call_args_list[0][0][0] == "multi-step task"
+        for call in mock_agent.run.call_args_list[1:]:
+            assert call[0][0] is None
+
+    @pytest.mark.asyncio
+    async def test_user_prompt_passed_on_first_call_when_no_deferred(self) -> None:
+        from codebase_rag.main import _run_agent_response_loop
+        from codebase_rag.types_defs import CHAT_LOOP_UI, ConfirmationToolNames
+
+        mock_agent = MagicMock()
+        mock_agent.run = AsyncMock(return_value=self._make_response("Hello"))
+        tool_names = ConfirmationToolNames(
+            replace_code="replace",
+            create_file="create",
+            shell_command="shell",
+            structural_replace="structural_replace",
+        )
+        ctx, log_evt, approvals, refresh, status = self._patches()
+
+        with ctx as mock_ctx, log_evt, approvals, refresh, status:
+            mock_ctx.console.print = MagicMock()
+            mock_ctx.session = SessionState()
+
+            await _run_agent_response_loop(
+                mock_agent, [], "just a question", CHAT_LOOP_UI, tool_names
+            )
+
+        assert mock_agent.run.call_count == 1
+        assert mock_agent.run.call_args_list[0][0][0] == "just a question"
+        assert mock_agent.run.call_args_list[0][1].get("deferred_tool_results") is None
+
+    @pytest.mark.asyncio
+    async def test_multimodal_user_prompt_not_resent_after_approval(self) -> None:
+        from pydantic_ai import BinaryContent, DeferredToolRequests
+
+        from codebase_rag.main import _run_agent_response_loop
+        from codebase_rag.types_defs import CHAT_LOOP_UI, ConfirmationToolNames
+
+        multimodal_prompt = [
+            "look at this image",
+            BinaryContent(data=b"\x89PNG\r\n", media_type="image/png"),
+        ]
+        mock_agent = MagicMock()
+        mock_agent.run = AsyncMock(
+            side_effect=[
+                self._make_response(DeferredToolRequests(approvals=[])),
+                self._make_response("Analyzed"),
+            ]
+        )
+        tool_names = ConfirmationToolNames(
+            replace_code="replace",
+            create_file="create",
+            shell_command="shell",
+            structural_replace="structural_replace",
+        )
+        ctx, log_evt, approvals, refresh, status = self._patches()
+
+        with ctx as mock_ctx, log_evt, approvals, refresh, status:
+            mock_ctx.console.print = MagicMock()
+            mock_ctx.session = SessionState()
+
+            await _run_agent_response_loop(
+                mock_agent, [], multimodal_prompt, CHAT_LOOP_UI, tool_names
+            )
+
+        assert mock_agent.run.call_count == 2
+        assert mock_agent.run.call_args_list[0][0][0] is multimodal_prompt
+        assert mock_agent.run.call_args_list[1][0][0] is None
+
+    @pytest.mark.asyncio
+    async def test_deferred_results_passed_only_after_approval(self) -> None:
+        from pydantic_ai import DeferredToolRequests, DeferredToolResults
+
+        from codebase_rag.main import _run_agent_response_loop
+        from codebase_rag.types_defs import CHAT_LOOP_UI, ConfirmationToolNames
+
+        approved = DeferredToolResults()
+        mock_agent = MagicMock()
+        mock_agent.run = AsyncMock(
+            side_effect=[
+                self._make_response(DeferredToolRequests(approvals=[])),
+                self._make_response("Done"),
+            ]
+        )
+        tool_names = ConfirmationToolNames(
+            replace_code="replace",
+            create_file="create",
+            shell_command="shell",
+            structural_replace="structural_replace",
+        )
+
+        with (
+            patch("codebase_rag.main.app_context") as mock_ctx,
+            patch("codebase_rag.main.log_session_event"),
+            patch(
+                "codebase_rag.main._process_tool_approvals",
+                new=AsyncMock(return_value=approved),
+            ),
+            patch("codebase_rag.main._refresh_context_tokens", new=AsyncMock()),
+            patch("codebase_rag.main._thinking_with_status_bar"),
+        ):
+            mock_ctx.console.print = MagicMock()
+            mock_ctx.session = SessionState()
+
+            await _run_agent_response_loop(
+                mock_agent, [], "edit file", CHAT_LOOP_UI, tool_names
+            )
+
+        first_kwargs = mock_agent.run.call_args_list[0][1]
+        second_kwargs = mock_agent.run.call_args_list[1][1]
+        assert first_kwargs.get("deferred_tool_results") is None
+        assert second_kwargs.get("deferred_tool_results") is approved
 
 
 class TestCommandConstants:

@@ -1,36 +1,18 @@
 from __future__ import annotations
 
-# (H) Generic error wrapper
+# Generic error wrapper
 ERROR_WRAPPER = "Error: {message}"
 
-# (H) File operation errors
+# File operation errors
 FILE_NOT_FOUND = "File not found."
 FILE_NOT_FOUND_OR_DIR = "File not found or is a directory: {path}"
-BINARY_FILE = "File '{path}' is a binary file. Use the 'analyze_document' tool for this file type."
+BINARY_FILE = "File '{path}' is a binary file. Ask the user to attach it inline if they want it analyzed."
 UNICODE_DECODE = (
     "File '{path}' could not be read as text. It may be a binary file. "
-    "If it is a document (e.g., PDF), use the 'analyze_document' tool."
+    "If it is a document (e.g., PDF), ask the user to attach it inline."
 )
 
-# (H) Document analyzer errors
-DOCUMENT_UNSUPPORTED = (
-    "Error: Document analysis is not supported for the current LLM provider."
-)
-DOC_FILE_NOT_FOUND = "Error: File not found at '{path}'."
-DOC_SECURITY_RISK = "Error: Security risk: file path {path} is outside the project root"
-DOC_ACCESS_OUTSIDE_ROOT = (
-    "Error: Security risk: Attempted to access file outside of project root: {path}"
-)
-DOC_API_VALIDATION = "Error: API validation failed: {error}"
-DOC_API_ERROR = "Error: API error: {error}"
-DOC_IMAGE_PROCESS = (
-    "Error: Unable to process the image file. "
-    "The image may be corrupted or in an unsupported format."
-)
-DOC_ANALYSIS_FAILED = "Error: An error occurred during analysis: {error}"
-DOC_DURING_ANALYSIS = "Error: Document analysis failed: {error}"
-
-# (H) Directory errors
+# Directory errors
 DIRECTORY_INVALID = "Error: '{path}' is not a valid directory."
 DIRECTORY_EMPTY = "Error: The directory '{path}' is empty."
 DIRECTORY_LIST_FAILED = "Error: Could not list contents of '{path}'."
@@ -39,7 +21,7 @@ DIRECTORY_PATH_OUTSIDE_ROOT = (
     "Use a relative path from the project root, or the full absolute path within it."
 )
 
-# (H) Shell command errors
+# Shell command errors
 COMMAND_NOT_ALLOWED = "Command '{cmd}' is not in the allowlist.{suggestion} Available commands: {available}"
 COMMAND_EMPTY = "Empty command provided."
 COMMAND_DANGEROUS = "Rejected dangerous command: {cmd}"
@@ -47,22 +29,40 @@ COMMAND_DANGEROUS_BLOCKED = "Blocked dangerous command '{cmd}': {reason}"
 COMMAND_DANGEROUS_PATTERN = "Command matches dangerous pattern: {reason}"
 COMMAND_TIMEOUT = "Command '{cmd}' timed out after {timeout} seconds."
 COMMAND_SUBSHELL_NOT_ALLOWED = "Subshell execution not allowed: {pattern}"
+COMMAND_NONINTERACTIVE_DENIED = (
+    "Command '{command}' is not permitted in this non-interactive session: "
+    "{reason}. Use read-only commands with repo-relative paths."
+)
+NONINTERACTIVE_NOT_READ_ONLY = "only read-only commands are available"
+NONINTERACTIVE_WRITE_FORM = "file-writing options are not available"
+NONINTERACTIVE_REDIRECT = "redirection is not available"
+NONINTERACTIVE_FOLLOW_SYMLINKS = "symlink-following traversal is not available"
+NONINTERACTIVE_FIND_MUTATES = "find's mutating actions are not available"
+NONINTERACTIVE_PATH_ESCAPES = "absolute and parent-traversal paths are not available"
+NONINTERACTIVE_OPTION_CARRIED_INPUT = (
+    "options that read file lists or run programs are not available"
+)
 COMMAND_INVALID_SYNTAX = "Invalid command syntax: {segment}"
+COMMAND_SPAWN_FAILED = "Failed to spawn '{segment}' (executable: {executable}): {error}"
 
-# (H) Code retrieval errors
+# Code retrieval errors
 CODE_ENTITY_NOT_FOUND = "Entity not found in graph."
 CODE_MISSING_LOCATION = "Graph entry is missing location data."
+CODE_SOURCE_FILE_MISSING = (
+    "Source file not found on disk for '{path}' "
+    "(checked the stored absolute path and the current project root)."
+)
 
-# (H) File writer errors
+# File writer errors
 FILE_WRITER_SECURITY = (
     "Security risk: Attempted to create file outside of project root: {path}"
 )
 FILE_WRITER_CREATE = "Error creating file {path}: {error}"
 
-# (H) Export errors
+# Export errors
 EXPORT_FAILED = "Failed to export graph: {error}"
 
-# (H) MCP tool errors
+# MCP tool errors
 MCP_TOOL_RETURNED_NONE = "Tool returned None"
 MCP_INVALID_RESPONSE = "Code snippet tool returned an invalid response"
 MCP_PATH_NOT_EXISTS = "Target repository path does not exist: {path}"
@@ -71,5 +71,23 @@ MCP_PROJECT_NOT_FOUND = (
     "Project '{project_name}' not found. Available projects: {projects}"
 )
 
-# (H) CLI validation errors
+# CLI validation errors
 INVALID_POSITIVE_INT = "{value!r} is not a valid positive integer"
+INVALID_NON_NEGATIVE_FLOAT = "Value must be non-negative, got {value}"
+
+WEB_SEARCH_EMPTY_QUERY = "Error: The search query is empty."
+WEB_SEARCH_UNREACHABLE = "Error: The web search service could not be reached."
+WEB_SEARCH_FAILED = "Error: Web search failed (HTTP {status})."
+WEB_SEARCH_BAD_RESPONSE = (
+    "Error: The web search service returned an unreadable response."
+)
+WEB_SEARCH_NO_RESULTS = "No web results found for '{query}'."
+WEB_SEARCH_TAINTED_QUERY = (
+    "Error: Query refused: it contains a verbatim span of repository content "
+    "read this session, and web search queries must not carry local data off "
+    "the machine. Rephrase the query without quoting local content."
+)
+RESEARCH_FAILED = (
+    "Error: Web research failed. The cause was logged; it is withheld here "
+    "because provider error text is untrusted external content."
+)

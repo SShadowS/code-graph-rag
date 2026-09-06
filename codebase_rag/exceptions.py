@@ -1,4 +1,4 @@
-# (H) Provider validation errors
+# Provider validation errors
 GOOGLE_GLA_NO_KEY = (
     "Gemini GLA provider requires api_key. "
     "Set ORCHESTRATOR_API_KEY or CYPHER_API_KEY in .env file."
@@ -19,16 +19,43 @@ AZURE_NO_KEY = "Azure OpenAI provider requires api_key. Set AZURE_API_KEY in .en
 AZURE_NO_ENDPOINT = (
     "Azure OpenAI provider requires endpoint. Set AZURE_OPENAI_ENDPOINT in .env file."
 )
+MINIMAX_NO_KEY = (
+    "MiniMax provider requires api_key. "
+    "Set ORCHESTRATOR_API_KEY or CYPHER_API_KEY or MINIMAX_API_KEY in .env file."
+)
 OLLAMA_NOT_RUNNING = (
     "Ollama server not responding at {endpoint}. "
     "Make sure Ollama is running: ollama serve"
 )
+LITELLM_NO_ENDPOINT = (
+    "LiteLLM provider requires endpoint. "
+    "Set ORCHESTRATOR_ENDPOINT or CYPHER_ENDPOINT in .env file."
+)
+LITELLM_NOT_RUNNING = (
+    "LiteLLM proxy server not responding at {endpoint}. "
+    "Make sure LiteLLM proxy is running and API key is valid."
+)
 UNKNOWN_PROVIDER = "Unknown provider '{provider}'. Available providers: {available}"
 
-# (H) Dependency errors
+# Dependency errors
 SEMANTIC_EXTRA = "Semantic search requires 'semantic' extra: uv sync --extra semantic"
 
-# (H) Configuration errors
+# OpenAI-compatible embedding errors
+OPENAI_EMBEDDING_HTTP_ERROR = (
+    "OpenAI-compatible embedding request failed with status {status}: {body}"
+)
+OPENAI_EMBEDDING_COUNT_MISMATCH = (
+    "OpenAI-compatible embedding response returned {got} embeddings "
+    "for {expected} inputs"
+)
+OPENAI_EMBEDDING_MALFORMED_RESPONSE = (
+    "OpenAI-compatible embedding response is malformed: {error}"
+)
+OPENAI_EMBEDDING_BAD_INDEX = (
+    "OpenAI-compatible embedding response has an invalid or duplicate index: {index}"
+)
+
+# Configuration errors
 PROVIDER_EMPTY = "Provider name cannot be empty in 'provider:model' format."
 MODEL_ID_EMPTY = "Model ID cannot be empty."
 MODEL_FORMAT_INVALID = (
@@ -36,25 +63,39 @@ MODEL_FORMAT_INVALID = (
 )
 BATCH_SIZE_POSITIVE = "batch_size must be a positive integer"
 CONFIG = "{role} configuration error: {error}"
+MODEL_ID_UNKNOWN = "Unknown {provider} model {model_id!r}. Did you mean {suggestions}?"
+MODEL_ID_UNKNOWN_NO_MATCH = (
+    "Unknown {provider} model {model_id!r}. Known {provider} models: {known}"
+)
 
-# (H) Graph loading errors
+# Graph loading errors
 GRAPH_FILE_NOT_FOUND = "Graph file not found: {path}"
 FAILED_TO_LOAD_DATA = "Failed to load data from file"
 NODES_NOT_LOADED = "Nodes should be loaded"
 RELATIONSHIPS_NOT_LOADED = "Relationships should be loaded"
 DATA_NOT_LOADED = "Data should be loaded"
 
-# (H) Parser errors
+# Parser errors
 NO_LANGUAGES = "No Tree-sitter languages available."
 
-# (H) LLM errors
+# LLM errors
 LLM_INIT_CYPHER = "Failed to initialize CypherGenerator: {error}"
 LLM_INVALID_QUERY = "LLM did not generate a valid query. Output: {output}"
 LLM_DANGEROUS_QUERY = "LLM generated a destructive Cypher query (found '{keyword}'). Query rejected: {query}"
+LLM_UNBOUNDED_PATH = (
+    "LLM generated an unbounded variable-length path pattern "
+    "(e.g. [:TYPE*] or [:TYPE*N..]) which causes memory exhaustion on cyclic graphs. "
+    "Add an upper bound such as [:TYPE*1..6]. Query rejected: {query}"
+)
+LLM_DISALLOWED_PROCEDURE = (
+    "LLM generated a CALL to procedure '{name}' which is outside the read-only "
+    "MAGE allowlist. Query rejected: {query}"
+)
 LLM_GENERATION_FAILED = "Cypher generation failed: {error}"
 LLM_INIT_ORCHESTRATOR = "Failed to initialize RAG Orchestrator: {error}"
+LLM_INIT_RESEARCH = "Failed to initialize research sub-agent: {error}"
 
-# (H) Graph service errors
+# Graph service errors
 BATCH_SIZE = "batch_size must be a positive integer"
 CONN = "Not connected to Memgraph."
 AUTH_INCOMPLETE = (
@@ -62,11 +103,10 @@ AUTH_INCOMPLETE = (
     "Either provide both or neither."
 )
 
-# (H) Access control errors (used with raise)
+# Access control errors (used with raise)
 ACCESS_DENIED = "Access denied: Cannot access files outside the project root."
-DOC_UNSUPPORTED_PROVIDER = "DocumentAnalyzer does not support the 'local' LLM provider."
 
 
-# (H) Exception classes
+# Exception classes
 class LLMGenerationError(Exception):
     pass

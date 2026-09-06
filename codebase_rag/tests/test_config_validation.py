@@ -1,22 +1,43 @@
+import os
+import subprocess
+import sys
+
 import pytest
 
 from codebase_rag import constants as cs
 from codebase_rag.config import ModelConfig, format_missing_api_key_errors
 
 
-class TestValidateApiKey:
-    @pytest.mark.parametrize(
-        ("provider", "model_id"),
+def test_import_does_not_walk_parent_directories_for_dotenv(tmp_path) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    (parent / ".env").write_text("GOOGLE_API_KEY=parent-secret\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env.pop("GOOGLE_API_KEY", None)
+    result = subprocess.run(
         [
-            (cs.Provider.OLLAMA, "llama3"),
-            (cs.Provider.LOCAL, "local-model"),
-            (cs.Provider.VLLM, "vllm-model"),
+            sys.executable,
+            "-c",
+            "import os; import codebase_rag.config; "
+            "print(os.environ.get('GOOGLE_API_KEY', 'missing'))",
         ],
+        cwd=child,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding=cs.ENCODING_UTF8,
     )
-    def test_local_providers_skip_validation(
-        self, provider: cs.Provider, model_id: str
-    ) -> None:
-        cfg = ModelConfig(provider=provider, model_id=model_id)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "missing"
+
+
+class TestValidateApiKey:
+    def test_local_providers_skip_validation(self) -> None:
+        cfg = ModelConfig(provider=cs.Provider.OLLAMA, model_id="llama3")
         cfg.validate_api_key()
 
     def test_google_vertex_skips_validation(self) -> None:
@@ -63,6 +84,13 @@ class TestValidateApiKey:
         with pytest.raises(ValueError, match="cypher"):
             cfg.validate_api_key(role="cypher")
 
+    def test_minimax_provider_env_key_passes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(cs.ENV_MINIMAX_API_KEY, "minimax-key")
+        cfg = ModelConfig(provider=cs.Provider.MINIMAX, model_id="MiniMax-M3")
+        cfg.validate_api_key()
+
 
 class TestFormatMissingApiKeyErrors:
     def test_known_provider_openai(self) -> None:
@@ -75,6 +103,12 @@ class TestFormatMissingApiKeyErrors:
         msg = format_missing_api_key_errors(cs.Provider.ANTHROPIC)
         assert "ANTHROPIC_API_KEY" in msg
         assert "Anthropic" in msg
+
+    def test_known_provider_minimax(self) -> None:
+        msg = format_missing_api_key_errors(cs.Provider.MINIMAX)
+        assert "MINIMAX_API_KEY" in msg
+        assert "https://platform.minimax.io/" in msg
+        assert "MiniMax" in msg
 
     def test_unknown_provider_generic_message(self) -> None:
         msg = format_missing_api_key_errors("deepseek")

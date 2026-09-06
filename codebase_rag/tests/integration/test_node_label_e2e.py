@@ -14,10 +14,7 @@ if TYPE_CHECKING:
 
 pytestmark = [pytest.mark.integration]
 
-SKIP_GO = "Go is in development status"
 SKIP_SCALA = "Scala is in development status"
-SKIP_CSHARP = "C# is in development status"
-SKIP_PHP = "PHP is in development status"
 
 
 PYTHON_CODE = """\
@@ -233,29 +230,6 @@ int multiply(int a, int b) {
 }
 """
 
-CSHARP_CODE = """\
-public class MyCSharpClass {
-    private int value;
-
-    public MyCSharpClass() {
-        this.value = 0;
-    }
-
-    public int GetValue() {
-        return this.value;
-    }
-}
-
-public interface IMyInterface {
-    void DoSomething();
-}
-
-public enum Status {
-    Active,
-    Inactive
-}
-"""
-
 PHP_CODE = """\
 <?php
 
@@ -415,14 +389,6 @@ def cpp_module_impl_project(tmp_path: Path) -> Path:
     project = tmp_path / "cpp_module_impl_project"
     project.mkdir()
     (project / "mymodule_impl.cpp").write_text(CPP_MODULE_IMPL_CODE, encoding="utf-8")
-    return project
-
-
-@pytest.fixture
-def csharp_project(tmp_path: Path) -> Path:
-    project = tmp_path / "csharp_project"
-    project.mkdir()
-    (project / "Example.cs").write_text(CSHARP_CODE, encoding="utf-8")
     return project
 
 
@@ -642,7 +608,6 @@ class TestRustNodeLabels:
         assert "MyTrait" in interface_names
 
 
-@pytest.mark.skip(reason=SKIP_GO)
 class TestGoNodeLabels:
     def test_go_creates_class_nodes_for_structs(
         self, memgraph_ingestor: MemgraphIngestor, go_project: Path
@@ -825,46 +790,6 @@ class TestCppNodeLabels:
         assert "mymodule_impl" in module_names
 
 
-@pytest.mark.skip(reason=SKIP_CSHARP)
-class TestCSharpNodeLabels:
-    def test_csharp_creates_class_nodes(
-        self, memgraph_ingestor: MemgraphIngestor, csharp_project: Path
-    ) -> None:
-        index_project(memgraph_ingestor, csharp_project)
-
-        labels = get_node_labels(memgraph_ingestor)
-        assert NodeLabel.CLASS.value in labels
-
-        classes = get_nodes_by_label(memgraph_ingestor, NodeLabel.CLASS.value)
-        class_names = {n["name"] for n in classes}
-        assert "MyCSharpClass" in class_names
-
-    def test_csharp_creates_interface_nodes(
-        self, memgraph_ingestor: MemgraphIngestor, csharp_project: Path
-    ) -> None:
-        index_project(memgraph_ingestor, csharp_project)
-
-        labels = get_node_labels(memgraph_ingestor)
-        assert NodeLabel.INTERFACE.value in labels
-
-        interfaces = get_nodes_by_label(memgraph_ingestor, NodeLabel.INTERFACE.value)
-        interface_names = {n["name"] for n in interfaces}
-        assert "IMyInterface" in interface_names
-
-    def test_csharp_creates_enum_nodes(
-        self, memgraph_ingestor: MemgraphIngestor, csharp_project: Path
-    ) -> None:
-        index_project(memgraph_ingestor, csharp_project)
-
-        labels = get_node_labels(memgraph_ingestor)
-        assert NodeLabel.ENUM.value in labels
-
-        enums = get_nodes_by_label(memgraph_ingestor, NodeLabel.ENUM.value)
-        enum_names = {n["name"] for n in enums}
-        assert "Status" in enum_names
-
-
-@pytest.mark.skip(reason=SKIP_PHP)
 class TestPhpNodeLabels:
     def test_php_creates_class_nodes(
         self, memgraph_ingestor: MemgraphIngestor, php_project: Path
@@ -934,12 +859,11 @@ DEFINES_TEST_PARAMS = [
     ("typescript_project", None),
     ("javascript_project", None),
     ("rust_project", None),
-    ("go_project", SKIP_GO),
+    ("go_project", None),
     ("scala_project", SKIP_SCALA),
     ("java_project", None),
     ("cpp_project", None),
-    ("csharp_project", SKIP_CSHARP),
-    ("php_project", SKIP_PHP),
+    ("php_project", None),
     ("lua_project", None),
 ]
 

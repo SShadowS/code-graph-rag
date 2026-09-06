@@ -1,15 +1,29 @@
 from __future__ import annotations
 
-import torch
+import importlib
+from unittest.mock import MagicMock
 
-from codebase_rag.unixcoder import Beam
+import pytest
+
+# Optional heavyweight dependencies: a base install ships without the
+# `semantic` extra, so this module must SKIP rather than abort collection
+# (issue #1410). Only the third-party extras are skip conditions; the
+# first-party module is imported normally afterwards so a defect inside it
+# still fails collection instead of hiding as a skip.
+torch = pytest.importorskip("torch")
+pytest.importorskip("transformers")
+_unixcoder = importlib.import_module("codebase_rag.unixcoder")
+
+nn = torch.nn
+Beam = _unixcoder.Beam
+UniXcoder = _unixcoder.UniXcoder
 
 
 class TestBeamInit:
     def test_initializes_with_correct_size(self) -> None:
         beam = Beam(size=5, eos=2, device=torch.device("cpu"))
         assert beam.size == 5
-        assert beam._eos == 2
+        assert beam._eos == frozenset({2})
 
     def test_initializes_scores_to_zero(self) -> None:
         beam = Beam(size=3, eos=2, device=torch.device("cpu"))
@@ -168,6 +182,62 @@ class TestBeamBuildTargetTokens:
         ]
         result = beam.buildTargetTokens(preds)
         assert len(result[0]) == 3
+
+
+class TestBeamMultipleEos:
+    def test_normalizes_single_int_to_membership_set(self) -> None:
+        beam = Beam(size=2, eos=2, device=torch.device("cpu"))
+        assert beam._eos == frozenset({2})
+
+    def test_stops_on_any_eos_in_list(self) -> None:
+        # transformers can declare several valid stop ids; Beam must terminate
+        # on any of them, not just the first.
+        beam = Beam(size=1, eos=[2, 99], device=torch.device("cpu"))
+        preds = [[torch.tensor(5), torch.tensor(99), torch.tensor(6)]]
+        result = beam.buildTargetTokens(preds)
+        assert len(result[0]) == 1
+
+    def test_advance_records_completion_on_alternate_eos(self) -> None:
+        # advance must record a finished hypothesis and set eosTop when the top
+        # token is any configured EOS id (not just the first).
+        beam = Beam(size=1, eos=[2, 99], device=torch.device("cpu"))
+        word_probs = torch.full((1, 100), -1e9)
+        word_probs[0, 99] = 0.0
+        beam.advance(word_probs)
+        assert len(beam.finished) == 1
+        assert beam.eosTop is True
+
+
+class TestForwardAttentionMask:
+    def _make_uninitialized(self, pad_id: int) -> UniXcoder:
+        instance = UniXcoder.__new__(UniXcoder)
+        nn.Module.__init__(instance)
+        instance.config = MagicMock()
+        instance.config.pad_token_id = pad_id
+        return instance
+
+    def test_attention_mask_is_4d(self) -> None:
+        instance = self._make_uninitialized(pad_id=1)
+        captured: dict[str, torch.Size] = {}
+
+        def fake_model(
+            source_ids: torch.Tensor, attention_mask: torch.Tensor
+        ) -> tuple[torch.Tensor]:
+            captured["shape"] = attention_mask.shape
+            batch, seq = source_ids.shape
+            return (torch.zeros(batch, seq, 8),)
+
+        instance.model = MagicMock(side_effect=fake_model)
+
+        source_ids = torch.tensor([[2, 3, 4, 5, 1], [2, 3, 1, 1, 1]])
+        instance.forward(source_ids)
+
+        assert "shape" in captured
+        assert len(captured["shape"]) == 4
+        assert captured["shape"][0] == 2
+        assert captured["shape"][1] == 1
+        assert captured["shape"][2] == 5
+        assert captured["shape"][3] == 5
 
 
 class TestBeamGetHyp:

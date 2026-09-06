@@ -24,3 +24,44 @@ PROJECT.md
 .pypi_cache.json
 .omc
 site/
+
+# Eval harness scratch workspace (regenerated each run); result files are committed
+evals/results/l3_workspace/
+# Rust oracle build artifacts (the source + Cargo.lock are committed)
+evals/oracles/rs_oracle/target/
+evals/oracles/rs_oracle/.build.lock
+# TypeScript oracle deps (the source + package-lock.json are committed)
+evals/oracles/ts_oracle/node_modules/
+# Java oracle compiled classes (the source is committed)
+evals/oracles/java_oracle/*.class
+evals/oracles/java_oracle/.build-lock
+# Lua oracle deps (the source + package-lock.json are committed)
+evals/oracles/lua_oracle/node_modules/
+# PHP oracle deps (the source + package-lock.json are committed)
+evals/oracles/php_oracle/node_modules/
+# Ruby oracle deps (the source + package-lock.json are committed)
+evals/oracles/ruby_oracle/node_modules/
+# Node oracle install bookkeeping (completion marker + concurrent-install lock)
+evals/oracles/*/.node-deps-installed
+evals/oracles/*/.node-deps-lock/
+# Scala oracle build artifacts (the source is committed; scala-cli fetches deps)
+evals/oracles/scala_oracle/.scala-build/
+evals/oracles/scala_oracle/.bsp/
+.cgr-hash-cache.json
+.cgr-dir-mtimes.json
+.cgr-parser-fingerprint
+.cgr-exclusion-state.json
+.cgr-delombok-state.json
+.cgr-edit-history.json
+.cgr-edit-lock
+
+# Runtime call traces (pytest --cgr-trace default output)
+cgr-trace.jsonl
+
+# Indexing-benchmark corpus checkouts (pinned clones, see evals/indexing_bench.py)
+evals/results/corpora/
+evals/results/**/agentic_qa*records*.jsonl
+evals/results/logs/
+.cgr-parser-fingerprint
+.cgr-exclusion-state.json
+.cgr-*.tmp

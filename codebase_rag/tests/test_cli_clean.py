@@ -43,6 +43,40 @@ class TestCleanWithoutUpdateGraph:
         ingestor = _get_ingestor(mock_memgraph_connect)
         ingestor.clean_database.assert_called_once()
 
+    def test_clean_alone_purges_vector_store(
+        self,
+        mock_memgraph_connect: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        # Stale vectors keyed by recycled Memgraph node ids crowd out live
+        # hits and can map onto unrelated nodes after a clean rebuild.
+        with patch("codebase_rag.cli.clear_all_embeddings") as clear:
+            result = runner.invoke(
+                app,
+                ["start", "--clean", "--repo-path", str(tmp_path)],
+            )
+
+        assert result.exit_code == 0, result.output
+        clear.assert_called_once()
+
+    def test_clean_alone_surfaces_vector_purge_failure(
+        self,
+        mock_memgraph_connect: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        # A silently failed purge would report a clean database while stale
+        # vectors keep resolving to unrelated nodes after the rebuild.
+        with patch(
+            "codebase_rag.cli.clear_all_embeddings",
+            side_effect=RuntimeError("purge failed"),
+        ):
+            result = runner.invoke(
+                app,
+                ["start", "--clean", "--repo-path", str(tmp_path)],
+            )
+
+        assert result.exit_code != 0
+
     def test_clean_alone_deletes_hash_cache(
         self,
         mock_memgraph_connect: MagicMock,
@@ -119,7 +153,7 @@ class TestCleanWithoutUpdateGraph:
 class TestCleanWithUpdateGraph:
     @patch("codebase_rag.cli.GraphUpdater")
     @patch("codebase_rag.cli.load_parsers", return_value=({}, {}))
-    @patch("codebase_rag.cli.load_cgrignore_patterns")
+    @patch("codebase_rag.cli.load_ignore_patterns")
     def test_clean_with_update_deletes_hash_cache(
         self,
         mock_cgrignore: MagicMock,
@@ -145,7 +179,7 @@ class TestCleanWithUpdateGraph:
 
     @patch("codebase_rag.cli.GraphUpdater")
     @patch("codebase_rag.cli.load_parsers", return_value=({}, {}))
-    @patch("codebase_rag.cli.load_cgrignore_patterns")
+    @patch("codebase_rag.cli.load_ignore_patterns")
     def test_clean_with_update_calls_clean_database(
         self,
         mock_cgrignore: MagicMock,
@@ -169,7 +203,31 @@ class TestCleanWithUpdateGraph:
 
     @patch("codebase_rag.cli.GraphUpdater")
     @patch("codebase_rag.cli.load_parsers", return_value=({}, {}))
-    @patch("codebase_rag.cli.load_cgrignore_patterns")
+    @patch("codebase_rag.cli.load_ignore_patterns")
+    def test_clean_with_update_purges_vector_store(
+        self,
+        mock_cgrignore: MagicMock,
+        mock_load_parsers: MagicMock,
+        mock_graph_updater: MagicMock,
+        mock_memgraph_connect: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        mock_cgrignore.return_value = CgrignorePatterns(
+            exclude=frozenset(), unignore=frozenset()
+        )
+
+        with patch("codebase_rag.cli.clear_all_embeddings") as clear:
+            result = runner.invoke(
+                app,
+                ["start", "--clean", "--update-graph", "--repo-path", str(tmp_path)],
+            )
+
+        assert result.exit_code == 0, result.output
+        clear.assert_called_once()
+
+    @patch("codebase_rag.cli.GraphUpdater")
+    @patch("codebase_rag.cli.load_parsers", return_value=({}, {}))
+    @patch("codebase_rag.cli.load_ignore_patterns")
     def test_update_without_clean_preserves_hash_cache(
         self,
         mock_cgrignore: MagicMock,

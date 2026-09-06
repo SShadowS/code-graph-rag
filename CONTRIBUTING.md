@@ -1,12 +1,12 @@
 # Contributing to Code Graph RAG
 
-Thank you for your interest in contributing to Code Graph RAG! We welcome contributions from the community.
+Thank you for your interest in contributing to Code Graph RAG! We welcome contributions from the community. How the project is run, who decides what, and how to become a maintainer are described in [GOVERNANCE.md](GOVERNANCE.md).
 
 ## Getting Started
 
-1. **Browse Issues**: Check out our [GitHub Issues](https://github.com/vitali87/code-graph-rag/issues) to find tasks that need work
-   - Look for issues labeled `good first issue` for beginner-friendly tasks
-   - Issues labeled `help wanted` are open for community contributions
+1. **Browse Issues**: Check out our [issue tracker](https://github.com/vitali87/code-graph-rag/issues) to find tasks that need work
+   - Look for issues labelled `good first issue` for beginner-friendly tasks
+   - Issues labelled `help wanted` are open for community contributions
 2. **Pick an Issue**: Choose an issue that interests you and matches your skill level
 3. **Comment on the Issue**: Let us know you're working on it to avoid duplicate effort
 4. **Fork the Repository**: Create your own fork to work on
@@ -14,7 +14,7 @@ Thank you for your interest in contributing to Code Graph RAG! We welcome contri
 
 ### Issue Labels
 
-Our repository uses standardized labels to categorize issues and PRs:
+Our repository uses standardised labels to categorise issues and PRs:
 
 | Label              | Purpose                                                           |
 | ------------------ | ----------------------------------------------------------------- |
@@ -55,7 +55,7 @@ Labels are automatically synced from [`.github/labels.yml`](.github/labels.yml).
 
 3. **Make Your Changes**:
    - Follow the existing code style and patterns
-   - Add tests for new functionality
+   - Add tests: this is project policy, not a suggestion. New functionality must come with tests that exercise it, and bug fixes must include a regression test that fails without the fix
    - Update documentation if needed
    - Do not add inline comments (see Comment Policy below)
 
@@ -74,7 +74,7 @@ Labels are automatically synced from [`.github/labels.yml`](.github/labels.yml).
 
 - Keep PRs focused on a single issue or feature
 - Write clear, descriptive commit messages
-- Include tests for new functionality
+- Tests are required for new functionality and for bug fixes; PRs adding major functionality without tests will not be merged
 - Update documentation when necessary
 - Be responsive to feedback during code review
 
@@ -106,7 +106,7 @@ All checks run in parallel and must pass before a PR can be merged. A summary jo
 
 ```bash
 make lint          # Lint check
-make format        # Format check
+make format        # Apply formatting (ruff format writes files; CI uses ruff format --check)
 make typecheck     # Type check
 make test-parallel # Unit tests in parallel
 make test-integration  # Integration tests (requires Docker)
@@ -147,11 +147,20 @@ This process ensures that human reviewers focus on high-level design and logic r
 
 ### Agentic Framework
 
-- **PydanticAI Only**: This project uses PydanticAI as the official agentic framework. Do not introduce other frameworks like LangChain, CrewAI, or AutoGen.
+- **PydanticAI for now**: PydanticAI is the agentic framework the project runs on today. That is a current choice, not a permanent commitment, and a well-argued case for moving is welcome. What it does rule out is arriving at a second framework by accident, so do not introduce one (LangChain, CrewAI, AutoGen) as part of a feature pull request. Open an issue first, as `GOVERNANCE.md` asks for architectural decisions.
+
+### External Service Integrations
+
+Integrations with external services (search APIs, model hosts, data providers) are welcome, on these terms:
+
+- **Free tier only**: The open-source tree carries capability that works without payment. Do not add configuration that selects a vendor's paid plan, and do not document a route to one. Paid capability belongs in [Enterprise Services](https://code-graph-rag.com/enterprise), not in an environment variable here.
+- **No single-vendor lock**: A generic capability resolves its backend from configuration, the way model and embedding providers already do in `codebase_rag/config.py`. A capability that works only for holders of one vendor's key is not a capability this project has.
+- **Keyless default**: Where a provider needs no account, it is the default, so the feature works on a fresh checkout.
+- **Disclose affiliation**: If you work for, or are compensated by, the service you are integrating, say so in the pull request description.
 
 ### Code Standards
 
-- **Heavy Pydantic Usage**: Use Pydantic models extensively for data validation, serialization, and configuration
+- **Heavy Pydantic Usage**: Use Pydantic models extensively for data validation, serialisation, and configuration
 - **Package Management**: Use `uv` for all dependency management and virtual environments
 - **Code Quality**: Use `ruff` for linting and formatting - run `ruff check` and `ruff format` before submitting
 - **Type Safety**: Use type hints everywhere and run `uv run ty check` for type checking
@@ -220,8 +229,8 @@ uv run ruff format .
 | **StrEnum**            | Constrained string constants used in comparisons, defaults, assignments |
 | **NamedTuple**         | Immutable records with named fields (lightweight, hashable)             |
 | **TypedDict**          | Dict shapes for function return types or JSON-like data                 |
-| **dataclass**          | Mutable class instances with behavior/methods                           |
-| **Pydantic BaseModel** | Configs needing validation, serialization, or schema generation         |
+| **dataclass**          | Mutable class instances with behaviour/methods                           |
+| **Pydantic BaseModel** | Configs needing validation, serialisation, or schema generation         |
 
 ```python
 from dataclasses import dataclass
@@ -330,14 +339,14 @@ class MyProtocol(Protocol):
 
 Only use `Callable` attributes when reusing complex callable types is necessary.
 
-### Code Organization
+### Code Organisation
 
 #### File Structure
 
 Standard files in each module:
 
 - `types_defs.py` - Type aliases, TypedDicts, NamedTuples (immutable structural types)
-- `models.py` - Dataclasses only (runtime data structures with behavior)
+- `models.py` - Dataclasses only (runtime data structures with behaviour)
 - `constants.py` - StrEnums, string literals, and application constants
 - `config.py` - Pydantic settings, environment config, and runtime configuration instances
 - `schemas.py` - All Pydantic BaseModel classes (data transfer objects, results, responses)
@@ -345,7 +354,7 @@ Standard files in each module:
 - `tool_errors.py` - Error messages returned by tools to the LLM/user
 - `exceptions.py` - Exception classes and their error message templates (for raise statements)
 
-#### Modularization
+#### Modularisation
 
 - Soft rule: keep files under 700 lines (after linting); split larger files into submodules
 - Group related functionality into submodules (e.g., `stem_ops/`, `tools/`, `srg_parser/`)
@@ -416,9 +425,9 @@ def process(mode: Mode = Mode.FAST): ...
 if status == Status.PENDING: ...
 ```
 
-#### Centralized Error Messages
+#### Centralised Error Messages
 
-Use an Enum with `__call__` for parameterized error messages:
+Use an Enum with `__call__` for parameterised error messages:
 
 ```python
 from enum import Enum
@@ -627,7 +636,7 @@ If a helper function is trivial and used once, inline it.
 
 #### Move Assignments Close to Usage
 
-Declare variables as close to their usage as possible to minimize cognitive load and prevent stranded variables:
+Declare variables as close to their usage as possible to minimise cognitive load and prevent stranded variables:
 
 ```python
 # Bad - assignment far from usage
@@ -687,10 +696,6 @@ def save_order(order):
 def save_item(item):
     _save(SQL_ITEM, item.dict())
 ```
-
-#### No Comments or Docstrings
-
-Code should be self-documenting. Exception: comments prefixed with `(H)` are allowed.
 
 #### No Type Ignores, Casts, Any, or object
 
@@ -809,21 +814,11 @@ The scope (in parentheses) is optional and can contain alphanumeric characters, 
 
 ### Comment Policy
 
-**No inline comments are allowed** unless they meet one of these criteria:
+Write comments that explain **why** and **how**, not **what**. A comment that only restates the adjacent code adds no value; one that captures a non-obvious reason, a tricky invariant, or a concrete edge case earns its place.
 
-1. **Top-of-file comments**: Comments that appear before any code (including imports) are allowed
-2. **`(H)` marker**: Comments containing `(H)` are allowed - this stands for "Human" and indicates an intentional, human-written comment
-3. **Type annotations**: Comments containing `type:`, `noqa`, `pyright`, or `ty:` are allowed
+## Licensing of Contributions
 
-**Why this rule exists**: AI tools (like code assistants and LLMs) tend to generate redundant, obvious comments that clutter the codebase. Comments like `# Loop through items` or `# Return the result` add no value. This policy prevents AI-generated comment slop from polluting the code.
-
-If you need to add a comment, prefix it with `(H)`:
-
-```python
-# (H) This algorithm uses memoization because the recursive solution times out on large inputs
-```
-
-The pre-commit hook `no-inline-comments` enforces this rule automatically.
+This project is licensed under the [MIT licence](LICENSE). By submitting a contribution, you agree that it is your own work (or that you have the right to submit it) and that it is licensed to the project and its users under the same MIT licence. You retain copyright in your contribution; no copyright assignment is required.
 
 ## Questions?
 

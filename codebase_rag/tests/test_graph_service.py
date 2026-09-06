@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from codebase_rag.constants import NODE_UNIQUE_CONSTRAINTS
+from codebase_rag.constants import NODE_NAME_INDEXES, NODE_UNIQUE_CONSTRAINTS
 from codebase_rag.cypher_queries import (
     build_create_node_query,
     build_create_relationship_query,
@@ -338,8 +338,9 @@ class TestEnsureConstraints:
         ingestor = MemgraphIngestor(host="localhost", port=7687)
         executed_queries: list[str] = []
 
-        def capture_query(query: str) -> None:
+        def capture_query(query: str) -> list[dict]:
             executed_queries.append(query)
+            return []
 
         with patch.object(
             MemgraphIngestor, "_execute_query", side_effect=capture_query
@@ -354,19 +355,119 @@ class TestEnsureConstraints:
         ingestor = MemgraphIngestor(host="localhost", port=7687)
         call_count = 0
 
-        def fail_then_succeed(query: str) -> None:
+        def fail_first_create(query: str) -> list[dict]:
             nonlocal call_count
             call_count += 1
-            if call_count == 1:
+            if query.startswith("CREATE CONSTRAINT") and call_count == 4:
                 raise RuntimeError("Constraint already exists")
+            return []
 
         with patch.object(
-            MemgraphIngestor, "_execute_query", side_effect=fail_then_succeed
+            MemgraphIngestor, "_execute_query", side_effect=fail_first_create
         ):
             ingestor.ensure_constraints()
 
-        expected_queries = len(NODE_UNIQUE_CONSTRAINTS) * 2
+        # One SHOW, two damage probes, a create-constraint and a
+        # create-index per label, plus a name index per non-name-keyed label.
+        expected_queries = 3 + len(NODE_UNIQUE_CONSTRAINTS) * 2 + len(NODE_NAME_INDEXES)
         assert call_count == expected_queries
+
+    def test_continues_on_name_index_error(self) -> None:
+        # A failing name-index CREATE (e.g. the index already exists) must not
+        # abort the loop: every remaining name index is still attempted.
+        ingestor = MemgraphIngestor(host="localhost", port=7687)
+        executed_queries: list[str] = []
+
+        def fail_first_name_index(query: str) -> list[dict]:
+            executed_queries.append(query)
+            if query == f"CREATE INDEX ON :{NODE_NAME_INDEXES[0]}(name);":
+                raise RuntimeError("Index already exists")
+            return []
+
+        with patch.object(
+            MemgraphIngestor, "_execute_query", side_effect=fail_first_name_index
+        ):
+            ingestor.ensure_constraints()
+
+        for label in NODE_NAME_INDEXES:
+            assert f"CREATE INDEX ON :{label}(name);" in executed_queries
+
+
+class TestLegacyPathKeyMigration:
+    """Superseded Folder/File relative-path keys must migrate safely (#897)."""
+
+    LEGACY_ROWS = [
+        {"constraint type": "unique", "label": "Folder", "properties": ["path"]},
+        {"constraint type": "unique", "label": "File", "properties": ["path"]},
+    ]
+    CLEAN_ROWS = [
+        {
+            "constraint type": "unique",
+            "label": "Folder",
+            "properties": ["absolute_path"],
+        },
+        {"constraint type": "unique", "label": "File", "properties": ["absolute_path"]},
+    ]
+
+    def _run_capture(self, show_rows: list[dict], damaged: bool = False) -> list[str]:
+        ingestor = MemgraphIngestor(host="localhost", port=7687)
+        executed: list[str] = []
+
+        def capture(query: str, params: dict | None = None) -> list[dict]:
+            executed.append(query)
+            if query.startswith("SHOW CONSTRAINT"):
+                return show_rows
+            if "damaged" in query:
+                return [{"damaged": 1}] if damaged else []
+            if "purged" in query:
+                return [{"purged": 2}]
+            return []
+
+        with patch.object(MemgraphIngestor, "_execute_query", side_effect=capture):
+            ingestor.ensure_constraints()
+        return executed
+
+    def test_drops_exact_legacy_constraints_when_present(self) -> None:
+        executed = self._run_capture(self.LEGACY_ROWS)
+
+        assert "DROP CONSTRAINT ON (n:Folder) ASSERT n.path IS UNIQUE;" in executed
+        assert "DROP CONSTRAINT ON (n:File) ASSERT n.path IS UNIQUE;" in executed
+
+    def test_purges_merged_and_keyless_nodes_when_legacy_present(self) -> None:
+        executed = self._run_capture(self.LEGACY_ROWS, damaged=True)
+
+        purge_queries = [q for q in executed if "DETACH DELETE" in q]
+        assert any("count(DISTINCT p)" in q for q in purge_queries)
+        assert any("absolute_path IS NULL" in q for q in purge_queries)
+
+    def test_purges_when_damage_outlives_constraints(self) -> None:
+        # An earlier partial upgrade may have dropped the legacy constraints
+        # while leaving the merged nodes behind: repair keys off the data.
+        executed = self._run_capture(self.CLEAN_ROWS, damaged=True)
+
+        purge_queries = [q for q in executed if "DETACH DELETE" in q]
+        assert any("count(DISTINCT p)" in q for q in purge_queries)
+        assert any("absolute_path IS NULL" in q for q in purge_queries)
+
+    def test_clean_database_issues_no_drops_or_purges(self) -> None:
+        executed = self._run_capture(self.CLEAN_ROWS)
+
+        assert not any(q.startswith("DROP CONSTRAINT") for q in executed)
+        assert not any("DETACH DELETE" in q for q in executed)
+
+    def test_show_constraint_failure_propagates(self) -> None:
+        ingestor = MemgraphIngestor(host="localhost", port=7687)
+
+        def refuse(query: str, params: dict | None = None) -> list[dict]:
+            if query.startswith("SHOW CONSTRAINT"):
+                raise ConnectionError("connection refused")
+            return []
+
+        with (
+            patch.object(MemgraphIngestor, "_execute_query", side_effect=refuse),
+            pytest.raises(ConnectionError),
+        ):
+            ingestor.ensure_constraints()
 
 
 class TestFlushNodesEdgeCases:
@@ -406,7 +507,7 @@ class TestFlushNodesEdgeCases:
         ingestor.conn = mock_conn
 
         ingestor.node_buffer.append(
-            ("File", None, {"path": "/valid.txt", "name": "valid"})
+            ("File", None, {"absolute_path": "/valid.txt", "name": "valid"})
         )
         ingestor.node_buffer.append(("File", None, {"name": "missing_path"}))
         ingestor.node_buffer.append(("UnknownLabel", None, {"id": "unknown"}))
@@ -489,6 +590,8 @@ class TestFlushAll:
 
 class TestFetchAllAndExecuteWrite:
     def test_fetch_all_delegates_to_execute_query(self) -> None:
+        from codebase_rag.config import settings
+
         ingestor = MemgraphIngestor(host="localhost", port=7687)
 
         with patch.object(
@@ -496,8 +599,22 @@ class TestFetchAllAndExecuteWrite:
         ) as mock_exec:
             result = ingestor.fetch_all("MATCH (n) RETURN n", {"limit": 10})
 
-            mock_exec.assert_called_once_with("MATCH (n) RETURN n", {"limit": 10})
+            expected_query = (
+                f"MATCH (n) RETURN n QUERY MEMORY LIMIT "
+                f"{settings.QUERY_MEMORY_LIMIT_MB} MB;"
+            )
+            mock_exec.assert_called_once_with(expected_query, {"limit": 10})
             assert result == [{"n": "result"}]
+
+    def test_fetch_all_preserves_existing_memory_limit(self) -> None:
+        ingestor = MemgraphIngestor(host="localhost", port=7687)
+        query_with_hint = "MATCH (n) RETURN n QUERY MEMORY LIMIT 512 MB;"
+
+        with patch.object(
+            MemgraphIngestor, "_execute_query", return_value=[]
+        ) as mock_exec:
+            ingestor.fetch_all(query_with_hint)
+            mock_exec.assert_called_once_with(query_with_hint, None)
 
     def test_execute_write_delegates_to_execute_query(self) -> None:
         ingestor = MemgraphIngestor(host="localhost", port=7687)
@@ -535,7 +652,7 @@ class TestCreateMode:
         ingestor.conn = mock_conn
 
         ingestor.node_buffer.append(
-            ("File", None, {"path": "/test.py", "name": "test"})
+            ("File", None, {"absolute_path": "/test.py", "name": "test"})
         )
         ingestor.flush_nodes()
 
@@ -553,7 +670,7 @@ class TestCreateMode:
         ingestor.conn = mock_conn
 
         ingestor.node_buffer.append(
-            ("File", None, {"path": "/test.py", "name": "test"})
+            ("File", None, {"absolute_path": "/test.py", "name": "test"})
         )
         ingestor.flush_nodes()
 

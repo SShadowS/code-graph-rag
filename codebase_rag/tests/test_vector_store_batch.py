@@ -1,7 +1,9 @@
+from collections.abc import Generator
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from codebase_rag.constants import VectorStoreBackend
 from codebase_rag.utils.dependencies import has_qdrant_client
 
 pytestmark = pytest.mark.skipif(
@@ -10,6 +12,14 @@ pytestmark = pytest.mark.skipif(
 
 _PATCH_CLIENT = "codebase_rag.vector_store.get_qdrant_client"
 _PATCH_SLEEP = "codebase_rag.vector_store.time.sleep"
+
+
+@pytest.fixture(autouse=True)
+def use_qdrant_backend() -> Generator[None, None, None]:
+    import codebase_rag.vector_store as vs
+
+    with patch.object(vs.settings, "VECTOR_STORE_BACKEND", VectorStoreBackend.QDRANT):
+        yield
 
 
 class TestUpsertWithRetry:
@@ -48,12 +58,13 @@ class TestUpsertWithRetry:
         mock_client = MagicMock()
         mock_client.upsert.side_effect = ConnectionError("timeout")
 
+        points = [MagicMock()]
         with (
             patch(_PATCH_CLIENT, return_value=mock_client),
             patch(_PATCH_SLEEP),
             pytest.raises(ConnectionError, match="timeout"),
         ):
-            _upsert_with_retry([MagicMock()])
+            _upsert_with_retry(points)
 
     def test_exponential_backoff_delays(self) -> None:
         from codebase_rag.vector_store import _upsert_with_retry

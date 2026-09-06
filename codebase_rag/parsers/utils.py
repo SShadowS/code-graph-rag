@@ -1,23 +1,30 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from loguru import logger
-from tree_sitter import Node, Query, QueryCursor
+from tree_sitter import Language, Node, Query, QueryCursor
 
 from .. import constants as cs
 from .. import logs
 from ..types_defs import (
     ASTNode,
+    CppDefinitionSpan,
+    DeferredParentLink,
+    FunctionRegistryTrieProtocol,
+    FunctionSpanKey,
     LanguageQueries,
     NodeType,
     PropertyDict,
     SimpleNameLookup,
     TreeSitterNodeProtocol,
 )
+from ..utils.path_utils import cached_relative_path, cached_resolve_posix
+from .ast_fingerprint import fingerprint_props
+from .endpoints import emit_endpoints, queue_endpoints
 
 if TYPE_CHECKING:
     from ..language_spec import LanguageSpec
@@ -25,15 +32,128 @@ if TYPE_CHECKING:
     from ..types_defs import FunctionRegistryTrieProtocol
 
 
+def _member_name_start_point(node: Node) -> tuple[int, int]:
+    """(line, column) of the definition's NAME token, falling back to the
+    node start (issue #1240: the persisted coordinates let incremental runs
+    rehydrate both the span key and Go's name-token alias, whose name can
+    sit on a later line than the declaration start)."""
+    name_node = node.child_by_field_name(cs.FIELD_NAME)
+    anchor = name_node if name_node is not None else node
+    return anchor.start_point[0] + 1, anchor.start_point[1]
+
+
+def follow_reexports(
+    qn: str,
+    import_mapping: dict[str, dict[str, str]],
+    function_registry: FunctionRegistryTrieProtocol,
+) -> str:
+    # `from .pkg import sym` records the importer's name against the re-export
+    # module (pkg.sym), not the real definition (pkg.mod.sym), so an unregistered
+    # qn may be a re-export. Follow the module's import map one hop at a time
+    # until a registered symbol is reached, guarding against cycles.
+    seen: set[str] = set()
+    current = qn
+    while (
+        current
+        and current not in seen
+        and current not in function_registry
+        and cs.SEPARATOR_DOT in current
+    ):
+        seen.add(current)
+        module_qn, _, name = current.rpartition(cs.SEPARATOR_DOT)
+        following = import_mapping.get(module_qn, {}).get(name)
+        if not following or following == current:
+            break
+        current = following
+    return current
+
+
+def function_span_key(module_qn: str, node: Node) -> FunctionSpanKey:
+    # tree-sitter points are 0-based; recorded lines are 1-based.
+    return (module_qn, node.start_point[0] + 1, node.start_point[1])
+
+
+_CPP_SPAN_LANGUAGES = frozenset({cs.SupportedLanguage.C, cs.SupportedLanguage.CPP})
+
+
+def record_cpp_definition_span(
+    spans: dict[str, list[CppDefinitionSpan]],
+    language: cs.SupportedLanguage | None,
+    file_path: Path | None,
+    repo_path: Path,
+    node: ASTNode,
+    label: str,
+    qualified_name: str,
+) -> None:
+    # Record the full line span of a tree-sitter-ingested C/C++ definition,
+    # keyed by relative path: the hybrid C++ frontend attributes each macro use
+    # to the tightest enclosing span after Pass 2, since macro cursors are
+    # TU-level and libclang qns use the wrong scheme where macros hide namespaces.
+    if language not in _CPP_SPAN_LANGUAGES or file_path is None:
+        return
+    rel = cached_relative_path(file_path, repo_path).as_posix()
+    spans.setdefault(rel, []).append(
+        CppDefinitionSpan(
+            node.start_point[0] + 1, node.end_point[0] + 1, label, qualified_name
+        )
+    )
+
+
+_QUERY_CACHE: dict[tuple[Language, str], Query] = {}
+_QUERY_LAST: tuple[tuple[Language, str], Query] | None = None
+
+
+def get_cached_query(language_obj: Language, query_text: str) -> Query:
+    # Key by the Language itself, never id(): Language hashes by grammar pointer,
+    # so wrappers dedupe, and the dict pins the key so a GC'd wrapper's address
+    # can't be reused to serve a wrong-grammar Query.
+    global _QUERY_LAST
+    key = (language_obj, query_text)
+    if _QUERY_LAST is not None and _QUERY_LAST[0] == key:
+        return _QUERY_LAST[1]
+    if key not in _QUERY_CACHE:
+        _QUERY_CACHE[key] = Query(language_obj, query_text)
+    result = _QUERY_CACHE[key]
+    _QUERY_LAST = (key, result)
+    return result
+
+
 class FunctionCapturesResult(NamedTuple):
     lang_config: LanguageSpec
     captures: dict[str, list[ASTNode]]
 
 
+def sorted_captures(cursor: QueryCursor, node: ASTNode) -> dict[str, list[ASTNode]]:
+    # tree-sitter v0.25 captures() returns nodes in non-deterministic order;
+    # sort by (start_byte, end_byte) for reproducibility. start_byte alone leaves
+    # nested same-start captures (the outer `Greeter().greet()` chain and its
+    # inner `Greeter()` call) in raw order, flipping between runs.
+    raw = cursor.captures(node)
+    result: dict[str, list[ASTNode]] = {}
+    for name, nodes in raw.items():
+        if len(nodes) <= 1:
+            result[name] = nodes
+        else:
+            is_sorted = True
+            prev_key = _span_key(nodes[0])
+            for i in range(1, len(nodes)):
+                cur_key = _span_key(nodes[i])
+                if cur_key < prev_key:
+                    is_sorted = False
+                    break
+                prev_key = cur_key
+            result[name] = nodes if is_sorted else sorted(nodes, key=_span_key)
+    return result
+
+
+def _span_key(n: ASTNode) -> tuple[int, int]:
+    return (n.start_byte, n.end_byte)
+
+
 def get_function_captures(
     root_node: ASTNode,
     language: cs.SupportedLanguage,
-    queries: dict[cs.SupportedLanguage, LanguageQueries],
+    queries: Mapping[cs.SupportedLanguage, LanguageQueries],
 ) -> FunctionCapturesResult | None:
     lang_queries = queries[language]
     lang_config = lang_queries[cs.QUERY_CONFIG]
@@ -42,13 +162,102 @@ def get_function_captures(
         return None
 
     cursor = QueryCursor(query)
-    captures = cursor.captures(root_node)
+    captures = sorted_captures(cursor, root_node)
     return FunctionCapturesResult(lang_config, captures)
+
+
+def extract_modifiers_and_decorators(
+    node: ASTNode, lang_queries: LanguageQueries
+) -> tuple[list[str], list[str]]:
+    query = lang_queries.get(cs.QUERY_HIGHLIGHTS)
+    if not query:
+        return [], []
+
+    cursor = get_query_cursor(query)
+
+    body_node = node.child_by_field_name(cs.FIELD_BODY)
+    header_end_byte = body_node.start_byte if body_node else node.end_byte
+
+    target_node = node
+    if node.parent and node.parent.type in (
+        cs.TS_PY_DECORATED_DEFINITION,
+        cs.TS_EXPORT_STATEMENT,
+        # Dart wraps a class member's function_signature in a
+        # method_signature that owns the `static` token.
+        cs.TS_DART_METHOD_SIGNATURE,
+    ):
+        target_node = node.parent
+
+    query_nodes = [target_node]
+    curr_sibling = target_node.prev_named_sibling
+    while curr_sibling and (
+        curr_sibling.type == cs.TS_RS_ATTRIBUTE_ITEM
+        or (
+            target_node.type == cs.TS_METHOD_DEFINITION
+            and curr_sibling.type == cs.TS_DECORATOR
+        )
+        # Dart metadata precedes the signature as annotation siblings.
+        or (
+            target_node.type
+            in (cs.TS_DART_METHOD_SIGNATURE, cs.TS_DART_FUNCTION_SIGNATURE)
+            and curr_sibling.type == cs.TS_DART_ANNOTATION
+        )
+    ):
+        query_nodes.insert(0, curr_sibling)
+        curr_sibling = curr_sibling.prev_named_sibling
+
+    modifiers: list[str] = []
+    decorators: list[str] = []
+
+    for q_node in query_nodes:
+        if q_node == target_node:
+            cursor.set_byte_range(q_node.start_byte, header_end_byte)
+        else:
+            cursor.set_byte_range(q_node.start_byte, q_node.end_byte)
+
+        captures = sorted_captures(cursor, q_node)
+        for name, nodes in captures.items():
+            if (
+                name.startswith(cs.CAPTURE_KEYWORD_MODIFIER)
+                or name == cs.CAPTURE_KEYWORD
+            ):
+                for n in nodes:
+                    text = safe_decode_text(n)
+                    if (
+                        text
+                        and text not in modifiers
+                        and text not in cs.EXCLUDED_KEYWORDS
+                    ):
+                        modifiers.append(text)
+            elif name.startswith(cs.CAPTURE_ATTRIBUTE) or name.startswith(
+                cs.CAPTURE_FUNCTION_DECORATOR
+            ):
+                for n in nodes:
+                    text = safe_decode_text(n)
+                    if text and text not in decorators:
+                        decorators.append(text)
+
+    return modifiers, decorators
 
 
 @lru_cache(maxsize=50000)
 def _cached_decode_bytes(text_bytes: bytes) -> str:
     return text_bytes.decode(cs.ENCODING_UTF8)
+
+
+def node_site_properties(node: Node) -> PropertyDict:
+    """Edge-site span of a tree-sitter node (issue #1522).
+
+    1-based lines, 0-based columns, end exclusive, matching the node
+    `start_line`/`start_col` convention so a site can be sliced straight
+    out of the file.
+    """
+    return {
+        cs.KEY_LINE: node.start_point[0] + 1,
+        cs.KEY_COL: node.start_point[1],
+        cs.KEY_END_LINE: node.end_point[0] + 1,
+        cs.KEY_END_COL: node.end_point[1],
+    }
 
 
 def safe_decode_text(node: ASTNode | TreeSitterNodeProtocol | None) -> str | None:
@@ -73,6 +282,923 @@ def contains_node(parent: ASTNode, target: ASTNode) -> bool:
     )
 
 
+def _decorator_tail_names(decorators: list[str]) -> set[str]:
+    return {
+        decorator.lstrip("@#[]() ")
+        .split("(")[0]
+        .split(cs.SEPARATOR_DOT)[-1]
+        .rstrip(")] ")
+        for decorator in decorators
+    }
+
+
+def _is_property_decorator(decorators: list[str]) -> bool:
+    return bool(_decorator_tail_names(decorators) & cs.PROPERTY_DECORATORS)
+
+
+def _is_abstract_decorator(decorators: list[str]) -> bool:
+    return bool(_decorator_tail_names(decorators) & cs.ABSTRACT_DECORATORS)
+
+
+_PY_NAMED_PARAMETERS = frozenset(
+    {cs.TS_PY_DEFAULT_PARAMETER, cs.TS_PY_TYPED_DEFAULT_PARAMETER}
+)
+_PY_KEYWORD_ONLY_BOUNDARIES = frozenset(
+    {cs.TS_PY_KEYWORD_SEPARATOR, cs.TS_PY_LIST_SPLAT_PATTERN}
+)
+_PY_SCOPE_BOUNDARIES = frozenset(
+    {
+        cs.TS_PY_FUNCTION_DEFINITION,
+        cs.TS_PY_CLASS_DEFINITION,
+        cs.TS_PY_DECORATED_DEFINITION,
+    }
+)
+
+
+def _python_parameter_name(param_node: Node) -> str | None:
+    if param_node.type == cs.TS_PY_IDENTIFIER:
+        return safe_decode_text(param_node)
+    if param_node.type in _PY_NAMED_PARAMETERS:
+        name_node = param_node.child_by_field_name(cs.FIELD_NAME)
+        if name_node is not None and name_node.type == cs.TS_PY_IDENTIFIER:
+            return safe_decode_text(name_node)
+        return None
+    if param_node.type == cs.TS_PY_TYPED_PARAMETER:
+        for child in param_node.children:
+            if child.type == cs.TS_PY_IDENTIFIER:
+                return safe_decode_text(child)
+    return None
+
+
+_PY_CLOSURE_SCOPES = frozenset({cs.TS_PY_FUNCTION_DEFINITION, cs.TS_PY_LAMBDA})
+_GO_CLOSURE_SCOPES = frozenset({cs.TS_GO_FUNC_LITERAL})
+
+
+class _CallableScanConfig(NamedTuple):
+    # Node types the invoked-parameter scan needs per language: the call node
+    # naming the callee via its `function` field, the identifier for a bare
+    # callee, the closure scopes that capture an enclosing parameter, and the
+    # class-like scopes that are skipped and never descended.
+    call_type: str
+    identifier_type: str
+    closure_types: frozenset[str]
+    opaque_types: frozenset[str]
+
+
+_PY_SCAN = _CallableScanConfig(
+    cs.TS_PY_CALL,
+    cs.TS_PY_IDENTIFIER,
+    _PY_CLOSURE_SCOPES,
+    frozenset({cs.TS_PY_CLASS_DEFINITION}),
+)
+_GO_SCAN = _CallableScanConfig(
+    cs.TS_GO_CALL_EXPRESSION,
+    cs.TS_IDENTIFIER,
+    _GO_CLOSURE_SCOPES,
+    frozenset(),
+)
+_JS_TS_CLOSURE_SCOPES = frozenset(
+    {
+        cs.TS_ARROW_FUNCTION,
+        cs.TS_FUNCTION_EXPRESSION,
+        cs.TS_FUNCTION_DECLARATION,
+    }
+)
+_JS_SCAN = _CallableScanConfig(
+    cs.TS_CALL_EXPRESSION,
+    cs.TS_IDENTIFIER,
+    _JS_TS_CLOSURE_SCOPES,
+    frozenset({cs.TS_CLASS_DECLARATION}),
+)
+_JS_TS_TYPED_PARAMETERS = frozenset(
+    {cs.TS_REQUIRED_PARAMETER, cs.TS_OPTIONAL_PARAMETER}
+)
+_CPP_CLOSURE_SCOPES = frozenset({cs.TS_CPP_LAMBDA_EXPRESSION})
+_CPP_SCAN = _CallableScanConfig(
+    cs.TS_CPP_CALL_EXPRESSION,
+    cs.CppNodeType.IDENTIFIER,
+    _CPP_CLOSURE_SCOPES,
+    frozenset(),
+)
+_CPP_PARAMETER_DECLARATIONS = frozenset(
+    {
+        cs.CppNodeType.PARAMETER_DECLARATION,
+        cs.CppNodeType.OPTIONAL_PARAMETER_DECLARATION,
+    }
+)
+
+# Rust parameter patterns that wrap the bound identifier (`&c`, `&mut a`, `ref b`,
+# `mut b`); unwrap past them (and any mutable_specifier) to the name.
+_RUST_REF_PATTERNS = frozenset(
+    {
+        cs.TS_RS_REFERENCE_PATTERN,
+        cs.TS_RS_REF_PATTERN,
+        cs.TS_RS_MUT_PATTERN,
+    }
+)
+
+
+def _invoked_parameter_names(
+    body_node: Node,
+    candidates: set[str],
+    scan: _CallableScanConfig,
+    scope_bound_names: Callable[[Node], set[str]],
+) -> set[str]:
+    # Every language differs only in its scan config and its scope-binding
+    # rule; the scan itself is shared.
+    invoked: set[str] = set()
+    _scan_invoked_parameters(
+        body_node, set(candidates), invoked, scan, scope_bound_names
+    )
+    return invoked
+
+
+def _cpp_scope_bound_names(scope_node: Node) -> set[str]:
+    # A C++ lambda's own parameters shadow a same-named captured parameter of the
+    # enclosing function, so subtract them before scanning the lambda body.
+    # Otherwise the lambda invoking its own `cb` looks like an invocation of the
+    # outer `cb`. The parameters hang off the lambda's `declarator`, an
+    # abstract_function_declarator whose `parameters` list mirrors a function's.
+    declarator = scope_node.child_by_field_name(cs.FIELD_DECLARATOR)
+    return set(_cpp_declarator_param_names(declarator))
+
+
+def cpp_declarator_name(declarator: Node | None) -> str | None:
+    # Unwrap pointer/reference/parenthesized/function declarators down to the
+    # bound identifier (`int (*cb)()` -> cb, `T& x` -> x, `Fn cb` -> cb).
+    current = declarator
+    while current is not None:
+        if current.type in (
+            cs.CppNodeType.IDENTIFIER,
+            cs.CppNodeType.FIELD_IDENTIFIER,
+        ):
+            return safe_decode_text(current)
+        if (inner := current.child_by_field_name(cs.FIELD_DECLARATOR)) is not None:
+            current = inner
+            continue
+        current = next(
+            (
+                child
+                for child in current.children
+                if child.is_named and cs.CPP_DECLARATOR_SUFFIX in child.type
+            ),
+            None,
+        )
+    return None
+
+
+def cpp_parameter_names(func_node: Node) -> list[str]:
+    # Ordered parameter names from the function declarator's parameter_list,
+    # unwrapping each parameter's declarator to its bound identifier.
+    declarator = func_node.child_by_field_name(cs.FIELD_DECLARATOR)
+    func_declarator = _find_descendant(declarator, cs.CppNodeType.FUNCTION_DECLARATOR)
+    return _cpp_declarator_param_names(func_declarator)
+
+
+def _cpp_declarator_param_names(declarator: Node | None) -> list[str]:
+    # Bound parameter names from a (function|abstract_function) declarator's
+    # `parameters` list, unwrapping each parameter's declarator to its identifier.
+    if declarator is None:
+        return []
+    params = declarator.child_by_field_name(cs.KEY_PARAMETERS)
+    if params is None:
+        return []
+    names: list[str] = []
+    for declaration in params.named_children:
+        if declaration.type not in _CPP_PARAMETER_DECLARATIONS:
+            continue
+        param_declarator = declaration.child_by_field_name(cs.FIELD_DECLARATOR)
+        if (name := cpp_declarator_name(param_declarator)) is not None:
+            names.append(name)
+    return names
+
+
+def _find_descendant(node: Node | None, node_type: str) -> Node | None:
+    if node is None:
+        return None
+    stack: list[Node] = [node]
+    while stack:
+        current = stack.pop()
+        if current.type == node_type:
+            return current
+        stack.extend(current.children)
+    return None
+
+
+def _js_ts_scope_bound_names(scope_node: Node) -> set[str]:
+    # A nested arrow/function's own parameters shadow a same-named captured
+    # parameter of the enclosing function.
+    return set(js_ts_parameter_names(scope_node))
+
+
+def js_ts_parameter_names(func_node: Node) -> list[str]:
+    # Ordered parameter names. TypeScript wraps each in required_parameter /
+    # optional_parameter (name under the `pattern` field); JavaScript uses a bare
+    # identifier. A single-parameter arrow without parens keeps its parameter on
+    # the `parameter` field. Destructuring patterns bind no callable name, skipped.
+    names: list[str] = []
+    params = func_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params is not None:
+        for child in params.named_children:
+            if child.type == cs.TS_IDENTIFIER:
+                if name := safe_decode_text(child):
+                    names.append(name)
+            elif child.type in _JS_TS_TYPED_PARAMETERS:
+                pattern = child.child_by_field_name(cs.TS_FIELD_PATTERN)
+                if (
+                    pattern is not None
+                    and pattern.type == cs.TS_IDENTIFIER
+                    and (name := safe_decode_text(pattern))
+                ):
+                    names.append(name)
+        return names
+    single = func_node.child_by_field_name(cs.TS_FIELD_PARAMETER)
+    if single is not None and single.type == cs.TS_IDENTIFIER:
+        if name := safe_decode_text(single):
+            names.append(name)
+    return names
+
+
+def _scan_invoked_parameters(
+    scope_node: Node,
+    candidates: set[str],
+    invoked: set[str],
+    config: _CallableScanConfig,
+    bound_names: Callable[[Node], set[str]],
+) -> None:
+    # Mark a candidate parameter invoked when it is called by bare name in this
+    # lexical scope. Descend into nested closures that CAPTURE a candidate (do not
+    # rebind it) so `outer(cb) { inner() { cb() } }` still attributes cb to outer,
+    # the closure form decorator/formatter factories use. A nested scope's own
+    # bound names are removed first so a shadowing local cannot masquerade as the
+    # captured outer parameter. Class-like scopes are skipped entirely.
+    if not candidates:
+        return
+    stack: list[Node] = [scope_node]
+    while stack:
+        node = stack.pop()
+        for child in node.children:
+            if child.type == config.call_type:
+                fn = child.child_by_field_name(cs.FIELD_FUNCTION)
+                if (
+                    fn is not None
+                    and fn.type == config.identifier_type
+                    and (name := safe_decode_text(fn)) in candidates
+                ):
+                    invoked.add(name)
+            if child.type in config.closure_types:
+                inner = candidates - bound_names(child)
+                _scan_invoked_parameters(child, inner, invoked, config, bound_names)
+                continue
+            if child.type in config.opaque_types:
+                continue
+            stack.append(child)
+
+
+def _go_scope_bound_names(scope_node: Node) -> set[str]:
+    # A nested func_literal's own parameters shadow a same-named captured
+    # parameter of the enclosing function.
+    return set(go_parameter_names(scope_node))
+
+
+def _python_scope_bound_names(scope_node: Node) -> set[str]:
+    # Names a nested function/lambda binds itself, which shadow a same-named
+    # captured parameter of an enclosing function: its parameters plus local
+    # assignment targets and nested def/class names in its body.
+    bound: set[str] = set()
+    params = scope_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params is not None:
+        for child in params.named_children:
+            if (name := _python_parameter_name(child)) is not None:
+                bound.add(name)
+    body = scope_node.child_by_field_name(cs.FIELD_BODY)
+    if body is not None:
+        _python_collect_bound_targets(body, bound)
+    return bound
+
+
+def _python_collect_bound_targets(node: Node, out: set[str]) -> None:
+    stack: list[Node] = [node]
+    while stack:
+        current = stack.pop()
+        for child in current.children:
+            child_type = child.type
+            if child_type in _PY_SCOPE_BOUNDARIES:
+                # A nested def/class NAME binds here, but its body has its own
+                # scope; record the name and do not descend. A decorated_definition
+                # has no `name` field of its own, since the name is on the inner
+                # function/class definition it wraps.
+                named = child
+                if child_type == cs.TS_PY_DECORATED_DEFINITION:
+                    named = next(
+                        (
+                            c
+                            for c in child.children
+                            if c.type
+                            in (
+                                cs.TS_PY_FUNCTION_DEFINITION,
+                                cs.TS_PY_CLASS_DEFINITION,
+                            )
+                        ),
+                        child,
+                    )
+                name_node = named.child_by_field_name(cs.FIELD_NAME)
+                if name_node is not None and (name := safe_decode_text(name_node)):
+                    out.add(name)
+                continue
+            if child_type in (cs.TS_PY_ASSIGNMENT, cs.TS_PY_FOR_STATEMENT):
+                # Both bind whatever their `left` names.
+                left = child.child_by_field_name(cs.TS_FIELD_LEFT)
+                if left is not None:
+                    _python_collect_target_identifiers(left, out)
+            elif child_type == cs.TS_PY_AS_PATTERN_TARGET:
+                # `with ... as x` and `except ... as x` bind x here.
+                _python_collect_target_identifiers(child, out)
+            elif child_type in _PY_IMPORT_STATEMENTS:
+                _python_collect_import_bound_names(child, out)
+            elif child_type == cs.TS_PY_GLOBAL_STATEMENT:
+                # `global x` rebinds x to module scope: it is not a capture of the
+                # enclosing function, so exclude it like a local binding.
+                for c in child.named_children:
+                    if c.type == cs.TS_PY_IDENTIFIER and (name := safe_decode_text(c)):
+                        out.add(name)
+            elif child_type == cs.TS_PY_CASE_PATTERN:
+                # A `match` case binds only its CAPTURE names, not value patterns.
+                _python_collect_case_pattern_bindings(child, out)
+            stack.append(child)
+
+
+def _python_collect_target_identifiers(node: Node, out: set[str]) -> None:
+    if node.type == cs.TS_PY_IDENTIFIER:
+        if name := safe_decode_text(node):
+            out.add(name)
+        return
+    for child in node.children:
+        _python_collect_target_identifiers(child, out)
+
+
+def _python_collect_case_pattern_bindings(node: Node, out: set[str]) -> None:
+    # A `match` case binds its CAPTURE patterns and nothing else. A bare name
+    # (`case token:`, `case [token]:`) parses as a single-identifier dotted_name and
+    # binds; a multi-part dotted_name (`case sentinel.token:`) is a VALUE pattern
+    # that compares and binds nothing -- collecting its identifiers would wrongly
+    # exclude a captured name used in a value position. `as` aliases are collected
+    # by the general as_pattern_target branch. Only single-identifier dotted_names
+    # (and their `_` wildcard, which decodes to nothing) are captured here.
+    stack: list[Node] = [node]
+    while stack:
+        current = stack.pop()
+        if current.type == cs.TS_PY_DOTTED_NAME:
+            idents = [
+                c for c in current.named_children if c.type == cs.TS_PY_IDENTIFIER
+            ]
+            if len(idents) == 1 and (name := safe_decode_text(idents[0])):
+                out.add(name)
+            continue
+        stack.extend(current.children)
+
+
+_PY_IMPORT_STATEMENTS = frozenset(
+    {cs.TS_PY_IMPORT_STATEMENT, cs.TS_PY_IMPORT_FROM_STATEMENT}
+)
+
+
+def _python_collect_import_bound_names(node: Node, out: set[str]) -> None:
+    # `import a.b` binds `a`; `import a.b as c` binds `c`; `from m import x` binds
+    # `x`; `from m import x as y` binds `y`. The imported items live under the
+    # `name` field; the from-module (`module_name` field) is the source, not a
+    # local binding, so it is skipped by keying off `name` only.
+    for item in node.children_by_field_name(cs.FIELD_NAME):
+        if item.type == cs.TS_ALIASED_IMPORT:
+            alias = item.child_by_field_name(cs.FIELD_ALIAS)
+            if alias is not None and (name := safe_decode_text(alias)):
+                out.add(name)
+        elif item.type == cs.TS_PY_DOTTED_NAME:
+            first = next(
+                (c for c in item.named_children if c.type == cs.TS_PY_IDENTIFIER),
+                None,
+            )
+            if first is not None and (name := safe_decode_text(first)):
+                out.add(name)
+
+
+def _python_collect_identifier_reads(node: Node, out: set[str]) -> None:
+    stack: list[Node] = [node]
+    while stack:
+        current = stack.pop()
+        if current.type == cs.TS_PY_IDENTIFIER:
+            if name := safe_decode_text(current):
+                out.add(name)
+            continue
+        stack.extend(current.children)
+
+
+def python_free_variable_names(func_node: Node) -> set[str]:
+    # Names READ in a nested function's body that it does not bind itself (its
+    # parameters, local assignment targets, and nested def/class names). Descends
+    # into inner nested scopes so a variable used only in a doubly-nested body is
+    # still free for this function -- needed so a capture composes transitively.
+    # Conservative: over-approximates (globals, builtins, and attribute names are
+    # swept in), but a capture only composes when a bare-name read reaches a sink
+    # AND that name is tainted at the definition site, so the extras record
+    # summaries that never compose -- sound and inert (issue #1197).
+    body = func_node.child_by_field_name(cs.FIELD_BODY)
+    if body is None:
+        return set()
+    reads: set[str] = set()
+    _python_collect_identifier_reads(body, reads)
+    return reads - _python_scope_bound_names(func_node)
+
+
+def python_parameter_names(func_node: Node) -> list[str]:
+    # Ordered parameter names with a leading self/cls dropped, so positions line
+    # up with how call-site arguments map to parameters for bound methods.
+    params_node = func_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params_node is None:
+        return []
+    names: list[str] = []
+    for child in params_node.named_children:
+        if (name := _python_parameter_name(child)) is not None:
+            names.append(name)
+    if names and names[0] in (cs.PY_KEYWORD_SELF, cs.PY_KEYWORD_CLS):
+        names = names[1:]
+    return names
+
+
+def python_positional_parameter_names(func_node: Node) -> list[str]:
+    # Declared POSITIONAL parameters, in order, with the receiver kept.
+    #
+    # Distinct from `python_parameter_names` in both respects, and both
+    # differences are load-bearing for arity diagnosis (issue #227):
+    # `*`/`*args` end the positional run because CPython counts nothing after
+    # them in "takes N positional arguments", and the receiver stays because
+    # CPython counts the bound `self` in that same N. `/` marks the preceding
+    # parameters positional-ONLY and does not end the run.
+    params_node = func_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params_node is None:
+        return []
+    names: list[str] = []
+    for child in params_node.named_children:
+        if child.type in _PY_KEYWORD_ONLY_BOUNDARIES:
+            break
+        if child.type == cs.TS_PY_DICTIONARY_SPLAT_PATTERN:
+            continue
+        if child.type == cs.TS_PY_POSITIONAL_SEPARATOR:
+            continue
+        if (name := _python_parameter_name(child)) is not None:
+            names.append(name)
+    return names
+
+
+def callable_parameter_indices(
+    func_node: Node, language: cs.SupportedLanguage | None
+) -> dict[str, int]:
+    # Maps each parameter invoked as a call inside the function body to its
+    # positional index in the call-site argument list (self/cls dropped so the
+    # index lines up with how bound methods are invoked).
+    if language == cs.SupportedLanguage.PYTHON:
+        names = python_parameter_names(func_node)
+        scan, scope_bound = _PY_SCAN, _python_scope_bound_names
+    elif language == cs.SupportedLanguage.GO:
+        names = go_parameter_names(func_node)
+        scan, scope_bound = _GO_SCAN, _go_scope_bound_names
+    elif language in cs.JS_TS_LANGUAGES:
+        names = js_ts_parameter_names(func_node)
+        scan, scope_bound = _JS_SCAN, _js_ts_scope_bound_names
+    elif language == cs.SupportedLanguage.CPP:
+        names = cpp_parameter_names(func_node)
+        scan, scope_bound = _CPP_SCAN, _cpp_scope_bound_names
+    else:
+        return {}
+    body_node = func_node.child_by_field_name(cs.FIELD_BODY)
+    if body_node is None or not names:
+        return {}
+    invoked = _invoked_parameter_names(body_node, set(names), scan, scope_bound)
+    if not invoked:
+        return {}
+    return {name: index for index, name in enumerate(names) if name in invoked}
+
+
+def go_parameter_names(func_node: Node) -> list[str]:
+    # Ordered parameter names from the `parameters` list (the receiver of a
+    # method is a separate field, so indices line up with call-site arguments).
+    params = func_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params is None:
+        return []
+    names: list[str] = []
+    for declaration in params.named_children:
+        if declaration.type != cs.TS_GO_PARAMETER_DECLARATION:
+            continue
+        for child in declaration.children:
+            if child.type == cs.TS_IDENTIFIER and (name := safe_decode_text(child)):
+                names.append(name)
+    return names
+
+
+# Position-aligned parameter slots for forward parameter-taint (issue #1169).
+# Unlike the *_parameter_names helpers above -- which compact the list, dropping
+# unnamed/destructured slots and so shifting every later index -- these return
+# ONE entry per formal positional slot, with None for a slot that binds no simple
+# name (unnamed C++/Go parameter, JS/TS destructuring pattern). The second tuple
+# element is the index of a variadic/rest slot, if any, so a caller can map every
+# argument at or after it to that parameter. Keeping indices aligned is what
+# prevents arg:<index> from binding to the wrong parameter (false source-to-sink
+# edges), the failure the compacting helpers would cause here.
+def go_positional_parameter_slots(
+    func_node: Node,
+) -> tuple[list[str | None], int | None]:
+    params = func_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params is None:
+        return [], None
+    names: list[str | None] = []
+    variadic_index: int | None = None
+    for declaration in params.named_children:
+        if declaration.type == cs.TS_GO_PARAMETER_DECLARATION:
+            # Go groups names sharing a type (`a, b int`) into one declaration
+            # with several identifiers; each identifier is its own slot. A
+            # type-only declaration (`func f(int)`) has no identifier child and
+            # is a single unnamed slot.
+            idents = [
+                safe_decode_text(child)
+                for child in declaration.children
+                if child.type == cs.TS_IDENTIFIER
+            ]
+            if idents:
+                names.extend(idents)
+            else:
+                names.append(None)
+        elif declaration.type == cs.TS_GO_VARIADIC_PARAMETER_DECLARATION:
+            if variadic_index is None:
+                variadic_index = len(names)
+            ident = next(
+                (c for c in declaration.children if c.type == cs.TS_IDENTIFIER),
+                None,
+            )
+            names.append(safe_decode_text(ident) if ident is not None else None)
+    return names, variadic_index
+
+
+def _js_ts_parameter_slot(child: Node) -> tuple[str | None, bool] | None:
+    # A single formal parameter -> (name_or_None, is_variadic), or None when the
+    # node occupies NO runtime positional slot (a TypeScript `this` parameter).
+    # A TS typed parameter (required_parameter / optional_parameter) wraps the
+    # real pattern -- an identifier, a `this`, a rest_pattern, or a destructuring
+    # pattern -- so it is unwrapped recursively; that is what makes a typed rest
+    # (`...args: string[]`) mark variadic and a typed `this` drop its slot.
+    node_type = child.type
+    if node_type == cs.TS_THIS_PARAMETER:
+        return None
+    if node_type == cs.TS_IDENTIFIER:
+        return safe_decode_text(child), False
+    if node_type in _JS_TS_TYPED_PARAMETERS:
+        pattern = child.child_by_field_name(cs.TS_FIELD_PATTERN)
+        if pattern is None:
+            return None, False
+        return _js_ts_parameter_slot(pattern)
+    if node_type == cs.TS_ASSIGNMENT_PATTERN:
+        left = child.child_by_field_name(cs.TS_FIELD_LEFT)
+        if left is not None and left.type == cs.TS_IDENTIFIER:
+            return safe_decode_text(left), False
+        return None, False
+    if node_type == cs.TS_REST_PATTERN:
+        ident = next(
+            (c for c in child.named_children if c.type == cs.TS_IDENTIFIER), None
+        )
+        return (safe_decode_text(ident) if ident is not None else None), True
+    return None, False
+
+
+def js_ts_positional_parameter_slots(
+    func_node: Node,
+) -> tuple[list[str | None], int | None]:
+    names: list[str | None] = []
+    variadic_index: int | None = None
+    params = func_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params is not None:
+        for child in params.named_children:
+            slot = _js_ts_parameter_slot(child)
+            if slot is None:
+                # A TypeScript `this` parameter is not a runtime argument, so it
+                # takes no slot and must not shift the parameters after it.
+                continue
+            name, is_variadic = slot
+            if is_variadic and variadic_index is None:
+                variadic_index = len(names)
+            names.append(name)
+        return names, variadic_index
+    single = func_node.child_by_field_name(cs.TS_FIELD_PARAMETER)
+    if single is not None and single.type == cs.TS_IDENTIFIER:
+        names.append(safe_decode_text(single))
+    return names, variadic_index
+
+
+def cpp_positional_parameter_slots(
+    func_node: Node,
+) -> tuple[list[str | None], int | None]:
+    declarator = func_node.child_by_field_name(cs.FIELD_DECLARATOR)
+    func_declarator = _find_descendant(declarator, cs.CppNodeType.FUNCTION_DECLARATOR)
+    if func_declarator is None:
+        return [], None
+    params = func_declarator.child_by_field_name(cs.KEY_PARAMETERS)
+    if params is None:
+        return [], None
+    names: list[str | None] = []
+    for declaration in params.named_children:
+        if declaration.type not in _CPP_PARAMETER_DECLARATIONS:
+            continue
+        param_declarator = declaration.child_by_field_name(cs.FIELD_DECLARATOR)
+        names.append(cpp_declarator_name(param_declarator))
+    return names, None
+
+
+def java_positional_parameter_slots(
+    func_node: Node,
+) -> tuple[list[str | None], int | None]:
+    # Java `formal_parameters` -> `formal_parameter` (name field) plus a trailing
+    # `spread_parameter` for varargs (`String... xs`), whose name lives in a nested
+    # variable_declarator rather than a `name` field. A `receiver_parameter`
+    # (`A this`) occupies no runtime slot and is dropped by handling only the two
+    # real shapes.
+    params = func_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params is None:
+        return [], None
+    names: list[str | None] = []
+    variadic_index: int | None = None
+    for param in params.named_children:
+        if param.type == cs.TS_FORMAL_PARAMETER:
+            name = param.child_by_field_name(cs.FIELD_NAME)
+            names.append(safe_decode_text(name) if name is not None else None)
+        elif param.type == cs.TS_SPREAD_PARAMETER:
+            if variadic_index is None:
+                variadic_index = len(names)
+            declarator = next(
+                (
+                    c
+                    for c in param.named_children
+                    if c.type == cs.TS_VARIABLE_DECLARATOR
+                ),
+                None,
+            )
+            name = (
+                declarator.child_by_field_name(cs.FIELD_NAME)
+                if declarator is not None
+                else None
+            )
+            names.append(safe_decode_text(name) if name is not None else None)
+    return names, variadic_index
+
+
+def csharp_positional_parameter_slots(
+    func_node: Node,
+) -> tuple[list[str | None], int | None]:
+    # C# `parameter_list` -> `parameter` (its `name` field survives this/ref/out
+    # modifiers). A `params T[] tail` is NOT wrapped in a `parameter`: the hidden
+    # _parameter_array rule inlines it as a bare `array_type` followed by a bare
+    # `identifier` sibling (grammar quirk, mirrored in csharp/utils). A bare
+    # array_type therefore opens the single trailing variadic slot and the next
+    # identifier carries its name; a normal `int[] arr` stays a `parameter`.
+    params = func_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params is None:
+        return [], None
+    names: list[str | None] = []
+    variadic_index: int | None = None
+    pending_variadic = False
+    for param in params.named_children:
+        if param.type == cs.TS_CSHARP_PARAMETER:
+            name = param.child_by_field_name(cs.FIELD_NAME)
+            names.append(safe_decode_text(name) if name is not None else None)
+            pending_variadic = False
+        elif param.type == cs.TS_CSHARP_ARRAY_TYPE:
+            if variadic_index is None:
+                variadic_index = len(names)
+            names.append(None)
+            pending_variadic = True
+        elif param.type == cs.TS_IDENTIFIER and pending_variadic:
+            names[-1] = safe_decode_text(param)
+            pending_variadic = False
+    return names, variadic_index
+
+
+def _rust_parameter_name(pattern: Node | None) -> str | None:
+    # A Rust parameter's `pattern` is usually an identifier but may be wrapped in a
+    # reference/ref/mut pattern (`&c`, `&mut a`, `ref b`); unwrap past any
+    # mutable_specifier to the bound identifier. A destructuring pattern
+    # (tuple/struct/slice) or `_` binds no single positional name -> None slot.
+    if pattern is None:
+        return None
+    if pattern.type == cs.TS_IDENTIFIER:
+        return safe_decode_text(pattern)
+    if pattern.type in _RUST_REF_PATTERNS:
+        inner = next(
+            (c for c in pattern.named_children if c.type != cs.TS_RS_MUTABLE_SPECIFIER),
+            None,
+        )
+        return _rust_parameter_name(inner)
+    return None
+
+
+def lua_positional_parameter_slots(
+    func_node: Node,
+) -> tuple[list[str | None], int | None]:
+    # Lua `parameters` holds bare `identifier` children plus a trailing `...`
+    # spelled `vararg_expression`, which takes the variadic slot and binds no
+    # name. A `function obj:method(a)` receiver is implicit (never a parameter
+    # node), and a `:` call passes it implicitly too, so the explicit arguments
+    # still line up with these slots and nothing has to be dropped.
+    params = func_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params is None:
+        return [], None
+    names: list[str | None] = []
+    variadic_index: int | None = None
+    for param in params.named_children:
+        if param.type == cs.TS_LUA_VARARG_EXPRESSION:
+            if variadic_index is None:
+                variadic_index = len(names)
+            names.append(None)
+            continue
+        if param.type == cs.TS_LUA_IDENTIFIER:
+            names.append(safe_decode_text(param))
+    return names, variadic_index
+
+
+def scala_positional_parameter_slots(
+    func_node: Node,
+) -> tuple[list[str | None], int | None]:
+    # Scala `parameters` -> `parameter` (name field). A repeated parameter
+    # (`xs: String*`) carries a `repeated_parameter_type` as its TYPE, which is
+    # the only marker distinguishing it from a normal one. Curried definitions
+    # (`def f(a: Int)(b: Int)`) have SEVERAL sibling `parameters` lists; the
+    # field yields the first, and only that one maps to arg:<index> at a call
+    # site, so the later lists are deliberately left alone.
+    params = func_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params is None:
+        return [], None
+    names: list[str | None] = []
+    variadic_index: int | None = None
+    for param in params.named_children:
+        if param.type != cs.TS_SCALA_PARAMETER:
+            continue
+        type_node = param.child_by_field_name(cs.FIELD_TYPE)
+        if (
+            type_node is not None
+            and type_node.type == cs.TS_SCALA_REPEATED_PARAMETER_TYPE
+            and variadic_index is None
+        ):
+            variadic_index = len(names)
+        name = param.child_by_field_name(cs.FIELD_NAME)
+        names.append(safe_decode_text(name) if name is not None else None)
+    return names, variadic_index
+
+
+def rust_positional_parameter_slots(
+    func_node: Node,
+) -> tuple[list[str | None], int | None]:
+    # Rust `parameters` -> `parameter` (pattern field). A `self_parameter` is the
+    # receiver, occupies no positional slot, and is dropped (like a TS `this`).
+    # Normal Rust fns have no varargs, so variadic_index stays None (extern `...`
+    # is out of scope).
+    params = func_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params is None:
+        return [], None
+    names: list[str | None] = []
+    for param in params.named_children:
+        if param.type == cs.TS_RS_SELF_PARAMETER:
+            continue
+        if param.type == cs.TS_RS_PARAMETER:
+            names.append(
+                _rust_parameter_name(param.child_by_field_name(cs.TS_FIELD_PATTERN))
+            )
+    return names, None
+
+
+def c_positional_parameter_slots(
+    func_node: Node,
+) -> tuple[list[str | None], int | None]:
+    # C shares C++'s declarator grammar, so the C++ helpers apply unchanged: descend
+    # declarator -> function_declarator -> parameters, unwrapping each
+    # parameter_declaration's declarator to its identifier (None for an abstract
+    # prototype declarator). Unlike C++, a trailing `...` is a well-formed
+    # `variadic_parameter`, recorded as the variadic slot (printf-style sinks).
+    declarator = func_node.child_by_field_name(cs.FIELD_DECLARATOR)
+    func_declarator = _find_descendant(declarator, cs.CppNodeType.FUNCTION_DECLARATOR)
+    if func_declarator is None:
+        return [], None
+    params = func_declarator.child_by_field_name(cs.KEY_PARAMETERS)
+    if params is None:
+        return [], None
+    names: list[str | None] = []
+    variadic_index: int | None = None
+    for declaration in params.named_children:
+        if declaration.type == cs.CppNodeType.VARIADIC_PARAMETER:
+            if variadic_index is None:
+                variadic_index = len(names)
+            names.append(None)
+            continue
+        if declaration.type not in _CPP_PARAMETER_DECLARATIONS:
+            continue
+        param_declarator = declaration.child_by_field_name(cs.FIELD_DECLARATOR)
+        names.append(cpp_declarator_name(param_declarator))
+    return names, variadic_index
+
+
+def php_positional_parameter_slots(
+    func_node: Node,
+) -> tuple[list[str | None], int | None]:
+    # PHP formal parameters: each `simple_parameter` binds a `name` field whose
+    # `variable_name` text carries the `$` prefix (`$m`), matching how the callee
+    # body references the parameter -- so a seeded parameter pseudo-origin and its
+    # in-body uses key identically. Variadic (`...$args`) and constructor
+    # property-promotion parameters are a follow-up (issue #1174).
+    params = func_node.child_by_field_name(cs.FIELD_PARAMETERS)
+    if params is None:
+        return [], None
+    names: list[str | None] = []
+    for param in params.named_children:
+        if param.type != cs.TS_PHP_SIMPLE_PARAMETER:
+            names.append(None)
+            continue
+        name_node = param.child_by_field_name(cs.TS_FIELD_NAME)
+        names.append(
+            name_node.text.decode(cs.ENCODING_UTF8)
+            if name_node is not None and name_node.text is not None
+            else None
+        )
+    return names, None
+
+
+def dart_positional_parameter_slots(
+    func_node: Node,
+) -> tuple[list[str | None], int | None]:
+    # Dart parameters live in a `formal_parameter_list` child of the signature (not
+    # a field); each `formal_parameter` binds a `name` identifier. Optional-positional
+    # `[a, b]` and named `{a, b}` params wrap their formal_parameters in an
+    # `optional_formal_parameters` node, which is flattened. Dart requires those to
+    # come LAST, so appending them keeps every positional index correct while still
+    # seeding named params for `kw:<name>` composition. No variadic slot (#1173).
+    params = next(
+        (
+            c
+            for c in func_node.named_children
+            if c.type == cs.TS_DART_FORMAL_PARAMETER_LIST
+        ),
+        None,
+    )
+    if params is None:
+        return [], None
+    names: list[str | None] = []
+    for param in params.named_children:
+        if param.type == cs.TS_DART_FORMAL_PARAMETER:
+            names.append(_dart_parameter_name(param))
+        elif param.type == cs.TS_DART_OPTIONAL_FORMAL_PARAMETERS:
+            names.extend(
+                _dart_parameter_name(inner)
+                for inner in param.named_children
+                if inner.type == cs.TS_DART_FORMAL_PARAMETER
+            )
+    return names, None
+
+
+def _dart_parameter_name(param: Node) -> str | None:
+    name_node = param.child_by_field_name(cs.TS_FIELD_NAME)
+    return (
+        name_node.text.decode(cs.ENCODING_UTF8)
+        if name_node is not None and name_node.text is not None
+        else None
+    )
+
+
+def _js_ts_field_member_name(
+    node: ASTNode, language: cs.SupportedLanguage | None
+) -> str | None:
+    # The binding name of a JS/TS class-field arrow / fn-expr whose enclosing
+    # field definition holds it as its `value` (`helper = () => ...`), so the
+    # member is modelled as class_qn.helper. None for other languages/shapes.
+    if language not in cs.JS_TS_LANGUAGES:
+        return None
+    if node.type not in (cs.TS_ARROW_FUNCTION, cs.TS_FUNCTION_EXPRESSION):
+        return None
+    parent = node.parent
+    # `==` not `is`: py-tree-sitter returns a fresh Node wrapper on each access,
+    # so identity comparison always fails; Node equality compares the node id.
+    if parent is None or parent.child_by_field_name(cs.FIELD_VALUE) != node:
+        return None
+    name_node = parent.child_by_field_name(cs.FIELD_NAME)
+    if name_node is None or name_node.type not in (
+        cs.TS_IDENTIFIER,
+        cs.TS_PROPERTY_IDENTIFIER,
+    ):
+        return None
+    return safe_decode_text(name_node)
+
+
+def _method_end_line(node: ASTNode, language: cs.SupportedLanguage | None) -> int:
+    if language == cs.SupportedLanguage.DART:
+        from .dart import dart_definition_end_point
+
+        return dart_definition_end_point(node)[0] + 1
+    return node.end_point[0] + 1
+
+
 def ingest_method(
     method_node: ASTNode,
     container_qn: str,
@@ -82,50 +1208,279 @@ def ingest_method(
     simple_name_lookup: SimpleNameLookup,
     get_docstring_func: Callable[[ASTNode], str | None],
     language: cs.SupportedLanguage | None = None,
-    extract_decorators_func: Callable[[ASTNode], list[str]] | None = None,
+    lang_queries: LanguageQueries | None = None,
     method_qualified_name: str | None = None,
     file_path: Path | None = None,
     repo_path: Path | None = None,
-) -> None:
+    defer_containment: list[DeferredParentLink] | None = None,
+    module_qn: str | None = None,
+    external_override_names: frozenset[str] = frozenset(),
+    annotated_override_sink: dict[str, list[tuple[str, str]]] | None = None,
+    skip_cpp_artifact_check: bool = False,
+    pending_endpoints: list | None = None,
+    type_fact_sink: list | None = None,
+) -> str | None:
+    # Returns the registered method qn (post register_unique_qn, so with any
+    # @line dedup suffix) so a caller can wire further edges to the exact node,
+    # e.g. an anonymous-class override method's OVERRIDES edge to its base. Returns
+    # None only when the method has no resolvable name and nothing was registered.
     if language == cs.SupportedLanguage.CPP:
         from .cpp import utils as cpp_utils
 
+        # Inside an intact class body a macro invocation parsed as a type-less
+        # member (`FMT_CATCH(...) {}`) can never be a ctor of another class, so
+        # the shape check alone is decisive here. skip_cpp_artifact_check: the
+        # orphan-ctor flush already ran the class-registry tiebreak (a zero-param
+        # orphan ctor SHARES the artifact shape and must not be re-dropped here).
+        if not skip_cpp_artifact_check and cpp_utils.is_macro_invocation_artifact(
+            method_node
+        ):
+            return None
         method_name = cpp_utils.extract_function_name(method_node)
         if not method_name:
-            return
-    elif not (method_name_node := method_node.child_by_field_name(cs.FIELD_NAME)):
-        return
+            return None
+    elif language == cs.SupportedLanguage.CSHARP:
+        # Operators expose no `name` field (they would be dropped) and a
+        # destructor's `name` field collides with the constructor; synthesize
+        # the leaf so both register with the same name the FQN walk uses.
+        from .csharp import utils as csharp_utils
+
+        method_name = csharp_utils.synthesize_method_name(method_node)
+        if not method_name:
+            return None
+    elif language == cs.SupportedLanguage.DART:
+        # Constructors/factories expose no `name` field; take the last bare
+        # identifier (`factory C.empty` -> `empty`) so they are not dropped.
+        from .dart import dart_get_name
+
+        if not (method_name := dart_get_name(method_node)):
+            return None
+    elif (method_name_node := method_node.child_by_field_name(cs.FIELD_NAME)) is None:
+        # A JS/TS class-field arrow / fn-expr (`helper = () => ...`) has no name
+        # field on the function node; take the binding name from the enclosing
+        # field definition so it is modelled as a member instead of dropped.
+        if not (method_name := _js_ts_field_member_name(method_node, language)):
+            return None
     elif (text := method_name_node.text) is None:
-        return
+        return None
     else:
         method_name = text.decode(cs.ENCODING_UTF8)
 
-    method_qn = method_qualified_name or f"{container_qn}.{method_name}"
+    if language == cs.SupportedLanguage.CSHARP:
+        # Skip a leading `#if [Attr] #endif` directive so the start line is the
+        # conditional attribute, not the `#if` line (matches Roslyn's span).
+        from .csharp import utils as csharp_utils
 
-    decorators = extract_decorators_func(method_node) if extract_decorators_func else []
+        method_start_line, method_start_col = csharp_utils.definition_start_point(
+            method_node
+        )
+    else:
+        method_start_line = method_node.start_point[0] + 1
+        method_start_col = method_node.start_point[1]
+
+    method_qn = method_qualified_name or f"{container_qn}.{method_name}"
+    if language != cs.SupportedLanguage.CPP:
+        method_qn = function_registry.register_unique_qn(
+            method_qn, method_start_line, method_start_col
+        )
+
+    decorators = []
+    modifiers = []
+    if lang_queries:
+        modifiers, decorators = extract_modifiers_and_decorators(
+            method_node, lang_queries
+        )
+
+    # Local import breaks the export_detection -> cpp.utils -> utils cycle.
+    from . import export_detection
 
     method_props: PropertyDict = {
         cs.KEY_QUALIFIED_NAME: method_qn,
         cs.KEY_NAME: method_name,
+        cs.KEY_MODIFIERS: modifiers,
         cs.KEY_DECORATORS: decorators,
-        cs.KEY_START_LINE: method_node.start_point[0] + 1,
-        cs.KEY_END_LINE: method_node.end_point[0] + 1,
+        cs.KEY_START_LINE: method_start_line,
+        cs.KEY_START_COL: method_start_col,
+        cs.KEY_NAME_START_LINE: _member_name_start_point(method_node)[0],
+        cs.KEY_NAME_START_COL: _member_name_start_point(method_node)[1],
+        # Dart method signatures end before their sibling function_body;
+        # extend the span over the body (no-op for other languages).
+        cs.KEY_END_LINE: _method_end_line(method_node, language),
         cs.KEY_DOCSTRING: get_docstring_func(method_node),
+        cs.KEY_IS_EXPORTED: (
+            export_detection.is_exported(method_node, method_name, language)
+            if language is not None
+            else False
+        ),
     }
     if file_path is not None and repo_path is not None:
-        method_props[cs.KEY_PATH] = file_path.relative_to(repo_path).as_posix()
-        method_props[cs.KEY_ABSOLUTE_PATH] = file_path.resolve().as_posix()
+        method_props[cs.KEY_PATH] = cached_relative_path(
+            file_path, repo_path
+        ).as_posix()
+        method_props[cs.KEY_ABSOLUTE_PATH] = cached_resolve_posix(file_path)
+    # Python only, and the receiver is deliberately kept: CPython counts the
+    # bound `self` in "takes N positional arguments", so a stored list that
+    # dropped it would under-count by one on every method (issue #227).
+    if language == cs.SupportedLanguage.PYTHON:
+        method_props[cs.KEY_POSITIONAL_PARAMS] = python_positional_parameter_names(
+            method_node
+        )
+    # Local import: type_facts imports this module for safe_decode_with_fallback.
+    from .type_facts import extract_type_facts, queue_type_facts, type_facts_props
+
+    type_facts = extract_type_facts(method_node, language)
+    method_props.update(type_facts_props(type_facts))
+    queue_type_facts(
+        type_fact_sink, cs.NodeLabel.METHOD, method_qn, module_qn, type_facts
+    )
+    method_props.update(fingerprint_props(method_node))
+
+    # Persist @property status on the node so an incremental rebuild can restore
+    # the registry's property-name set for unchanged files (it re-marks from this
+    # flag rather than re-parsing decorators); property-dispatch call resolution
+    # depends on it, so without persistence those edges drop (issue #532 parity).
+    # A C# property_declaration IS a property by grammar (no decorator to
+    # inspect); marking it lets the C# member-read pass find it, exactly as
+    # Python's @property marking feeds its attribute-access pass. A Dart
+    # getter_signature is the same shape (issue #869): its accesses are
+    # attribute reads the Dart getter-read pass resolves through this flag.
+    # A JS/TS getter is a `method_definition` carrying the `get` keyword; its
+    # reads are member accesses (`obj.thing`), so mark it like the other
+    # languages' properties to feed the JS/TS getter-read pass. The keyword is a
+    # direct child but not always the first (`static get x()` leads with
+    # `static`); a method named `get` carries a property_identifier, not a `get`
+    # keyword node, so scanning direct children stays exact.
+    is_js_ts_getter = (
+        language in cs.JS_TS_LANGUAGES
+        and method_node.type == cs.TS_METHOD_DEFINITION
+        and any(
+            child.type == cs.TS_GET_ACCESSOR_KEYWORD for child in method_node.children
+        )
+    )
+    is_property = (
+        _is_property_decorator(decorators)
+        or is_js_ts_getter
+        or method_node.type
+        in (
+            cs.TS_CSHARP_PROPERTY_DECLARATION,
+            cs.TS_DART_GETTER_SIGNATURE,
+        )
+    )
+    if is_property:
+        method_props[cs.KEY_IS_PROPERTY] = True
+
+    # Overriding a method of an EXTERNAL stdlib base (click's TextWrapper
+    # subclass overriding textwrap's _wrap_chunks): the base's machinery invokes
+    # it, so the dead-code surfaces root this property.
+    if method_name in external_override_names:
+        method_props[cs.KEY_OVERRIDES_EXTERNAL] = True
+    # A Dart @override is only an EXTERNAL override if the resolved ancestry
+    # says so, which is unknowable until every class is registered: record it
+    # for resolve_deferred_inherits to judge.
+    if (
+        annotated_override_sink is not None
+        and cs.DART_OVERRIDE_ANNOTATION in decorators
+    ):
+        annotated_override_sink.setdefault(container_qn, []).append(
+            (method_qn, method_name)
+        )
 
     logger.info(logs.METHOD_FOUND.format(name=method_name, qn=method_qn))
     ingestor.ensure_node_batch(cs.NodeLabel.METHOD, method_props)
+    if pending_endpoints is not None:
+        # Deferred so router mount prefixes can resolve after Pass 2 (#877).
+        queue_endpoints(
+            pending_endpoints,
+            cs.NodeLabel.METHOD,
+            method_qn,
+            method_props.get(cs.KEY_DECORATORS),
+            module_qn,
+        )
+    else:
+        emit_endpoints(
+            ingestor,
+            cs.NodeLabel.METHOD,
+            method_qn,
+            method_props.get(cs.KEY_DECORATORS),
+        )
     function_registry[method_qn] = NodeType.METHOD
+    if is_property:
+        function_registry.mark_property(method_qn)
+    if _is_abstract_decorator(decorators):
+        function_registry.mark_abstract(method_qn)
+    function_registry.mark_callable_params(
+        method_qn, callable_parameter_indices(method_node, language)
+    )
     simple_name_lookup[method_name].add(method_qn)
 
+    # A container that may never register (a Rust impl on a primitive type)
+    # defers so the edge is verified once every pass has run, falling back
+    # to the module rather than a phantom the database would drop.
+    if defer_containment is not None and module_qn is not None:
+        defer_containment.append(
+            DeferredParentLink(
+                parent_label_guess=container_type,
+                parent_qn=container_qn,
+                child_label=cs.NodeLabel.METHOD,
+                child_qn=method_qn,
+                module_qn=module_qn,
+                rel_type=cs.RelationshipType.DEFINES_METHOD.value,
+            )
+        )
+        return method_qn
+
+    # The DEFINES_METHOD parent is matched by LABEL + qualified_name, so it must
+    # carry the container's real node label. Callers pass Class by default, but a
+    # trait/interface (Interface) or enum (Enum) container would then never match
+    # and drop the containment edge. Prefer the label it was registered with.
+    container_label = container_type
+    registered = function_registry.get(container_qn)
+    if registered is not None and registered != NodeType.METHOD:
+        container_label = cs.NodeLabel(registered.value)
+
     ingestor.ensure_relationship_batch(
-        (container_type, cs.KEY_QUALIFIED_NAME, container_qn),
+        (container_label, cs.KEY_QUALIFIED_NAME, container_qn),
         cs.RelationshipType.DEFINES_METHOD,
         (cs.NodeLabel.METHOD, cs.KEY_QUALIFIED_NAME, method_qn),
     )
+    return method_qn
+
+
+def module_function_props(
+    function_qn: str,
+    function_name: str,
+    function_node: ASTNode,
+    docstring: str | None,
+    file_path: Path | None,
+    repo_path: Path | None,
+) -> PropertyDict:
+    """Standard Function node properties for module-scoped JS/TS functions."""
+    # Lazy import: export_detection reaches back into this module through
+    # cpp.utils, so a top-level import would be circular.
+    from . import export_detection
+
+    props: PropertyDict = {
+        cs.KEY_QUALIFIED_NAME: function_qn,
+        cs.KEY_NAME: function_name,
+        cs.KEY_MODIFIERS: [],
+        cs.KEY_DECORATORS: [],
+        cs.KEY_START_LINE: function_node.start_point[0] + 1,
+        cs.KEY_START_COL: function_node.start_point[1],
+        cs.KEY_NAME_START_LINE: _member_name_start_point(function_node)[0],
+        cs.KEY_NAME_START_COL: _member_name_start_point(function_node)[1],
+        cs.KEY_END_LINE: function_node.end_point[0] + 1,
+        cs.KEY_DOCSTRING: docstring,
+        # JS/TS only (per this helper's contract), so the JS branch of the
+        # language dispatch applies regardless of which of the two it is.
+        cs.KEY_IS_EXPORTED: export_detection.is_exported(
+            function_node, function_name, cs.SupportedLanguage.JS
+        ),
+    }
+    if file_path is not None and repo_path is not None:
+        props[cs.KEY_PATH] = cached_relative_path(file_path, repo_path).as_posix()
+        props[cs.KEY_ABSOLUTE_PATH] = cached_resolve_posix(file_path)
+    props.update(fingerprint_props(function_node))
+    return props
 
 
 def ingest_exported_function(
@@ -138,19 +1493,47 @@ def ingest_exported_function(
     simple_name_lookup: SimpleNameLookup,
     get_docstring_func: Callable[[ASTNode], str | None],
     is_export_inside_function_func: Callable[[ASTNode], bool],
-) -> None:
+    file_path: Path | None,
+    repo_path: Path | None,
+) -> str | None:
+    # Returns the registered qn (None when skipped) so the caller can claim
+    # the function node's span against later registration passes.
     if is_export_inside_function_func(function_node):
-        return
+        return None
 
     function_qn = f"{module_qn}.{function_name}"
+    # The definition pass already ingests an exported function / const-arrow at
+    # its natural qn. Re-registering here would collide and mint a spurious
+    # `qn@line` duplicate that call resolution then binds to (mangling the callee
+    # qn). If the natural qn already exists, the node is done.
+    if function_qn in function_registry:
+        return None
+    # Same for a nested export (TS namespace / module block): the main pass
+    # already ingested it under its nested qn (e.g. lib.geo.helper), so a
+    # module-level re-ingest would mint a phantom duplicate plus a spurious
+    # Module-DEFINES edge. Walk ancestors rather than matching simple names, since
+    # a top-level export may share a name with an unrelated method in the module.
+    current = function_node.parent
+    while current is not None:
+        if current.type in (cs.TS_INTERNAL_MODULE, cs.TS_MODULE):
+            return None
+        current = current.parent
+    # No variant is reachable here while the guard above returns early on any
+    # qn already registered; the span is passed so the call stays correct if
+    # that guard moves.
+    function_qn = function_registry.register_unique_qn(
+        function_qn, function_node.start_point[0] + 1, function_node.start_point[1]
+    )
 
-    function_props = {
-        cs.KEY_QUALIFIED_NAME: function_qn,
-        cs.KEY_NAME: function_name,
-        cs.KEY_START_LINE: function_node.start_point[0] + 1,
-        cs.KEY_END_LINE: function_node.end_point[0] + 1,
-        cs.KEY_DOCSTRING: get_docstring_func(function_node),
-    }
+    function_props = module_function_props(
+        function_qn,
+        function_name,
+        function_node,
+        get_docstring_func(function_node),
+        file_path,
+        repo_path,
+    )
+    function_props[cs.KEY_IS_EXPORTED] = True
 
     logger.info(
         logs.EXPORT_FOUND.format(
@@ -158,8 +1541,20 @@ def ingest_exported_function(
         )
     )
     ingestor.ensure_node_batch(cs.NodeLabel.FUNCTION, function_props)
+    emit_endpoints(
+        ingestor,
+        cs.NodeLabel.FUNCTION,
+        function_qn,
+        function_props.get(cs.KEY_DECORATORS),
+    )
     function_registry[function_qn] = NodeType.FUNCTION
     simple_name_lookup[function_name].add(function_qn)
+    ingestor.ensure_relationship_batch(
+        (cs.NodeLabel.MODULE, cs.KEY_QUALIFIED_NAME, module_qn),
+        cs.RelationshipType.DEFINES,
+        (cs.NodeLabel.FUNCTION, cs.KEY_QUALIFIED_NAME, function_qn),
+    )
+    return function_qn
 
 
 def is_method_node(func_node: ASTNode, lang_config: LanguageSpec) -> bool:
@@ -167,13 +1562,39 @@ def is_method_node(func_node: ASTNode, lang_config: LanguageSpec) -> bool:
     if not isinstance(current, Node):
         return False
 
-    while current and current.type not in lang_config.module_node_types:
+    class_types = lang_config.class_node_types
+    func_types = lang_config.function_node_types
+    module_types = lang_config.module_node_types
+    body_field = cs.FIELD_BODY
+
+    while current is not None:
+        current_type = current.type
+        if current_type in module_types:
+            return False
+        if current_type in class_types:
+            return True
         if (
-            current.type in lang_config.function_node_types
-            and current.child_by_field_name(cs.FIELD_BODY) is not None
+            current_type in func_types
+            and current.child_by_field_name(body_field) is not None
         ):
             return False
-        if current.type in lang_config.class_node_types:
-            return True
         current = current.parent
     return False
+
+
+def module_qn_for_entity(
+    entity_qn: str, module_paths: Mapping[str, object]
+) -> str | None:
+    """The indexed module a fully-qualified entity belongs to, or None.
+
+    Entity qns extend their module's qn with class and member segments, so
+    the module is the longest strict prefix that names an indexed module
+    (issue #1347). Only key membership is read, so the mapping's value type
+    does not matter.
+    """
+    candidate = entity_qn
+    while cs.SEPARATOR_DOT in candidate:
+        candidate = candidate.rsplit(cs.SEPARATOR_DOT, 1)[0]
+        if candidate in module_paths:
+            return candidate
+    return None

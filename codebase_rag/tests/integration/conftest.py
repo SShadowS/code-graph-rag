@@ -3,14 +3,33 @@ from __future__ import annotations
 import socket
 import time
 from collections.abc import Generator
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
 from codebase_rag.services.graph_service import MemgraphIngestor
+from codebase_rag.tests.container_reaper import (
+    cgr_container_labels,
+    reap_orphaned_containers,
+)
 
 if TYPE_CHECKING:
     import mgclient
+
+_INTEGRATION_DIR = Path(__file__).parent
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    # Every integration test wipes the whole Memgraph database, and under xdist
+    # a session-scoped container fixture is per-worker, so -n auto races one
+    # container startup per worker. Pinning the directory to one xdist_group
+    # serialises them onto one worker with one container (--dist=loadgroup).
+    for item in items:
+        # Third-party plugins can collect virtual items with no path.
+        if item.path and _INTEGRATION_DIR in item.path.parents:
+            item.add_marker(pytest.mark.xdist_group("memgraph-integration"))
 
 
 @pytest.fixture(scope="session")
@@ -19,10 +38,23 @@ def memgraph_container() -> Generator[dict[str, str | int], None, None]:
     import time
 
     from testcontainers.core.container import DockerContainer
+    from testcontainers.core.docker_client import DockerClient
     from testcontainers.core.wait_strategies import LogMessageWaitStrategy
 
-    container = DockerContainer("memgraph/memgraph:latest")
+    # A previous run that was killed (OOM, CI timeout, kill -9) never reached
+    # the `container.stop()` below and left its container running; each one
+    # is a permanent charge against the memory the next run needs (issue
+    # #1628). Nothing in-process survives being killed, so the next session
+    # cleans up for the last one, by the labels this fixture puts on its own
+    # container: the marker, and the host and pid that own it, so a session
+    # sharing the daemon with a LIVE suite leaves that suite's database alone.
+    reap_orphaned_containers(DockerClient().client)
+
+    # Same engine line the packaged stack pins (issue #1257): integration
+    # tests must exercise the syntax the shipped Memgraph actually accepts.
+    container = DockerContainer("memgraph/memgraph:3.3.0")
     container.with_exposed_ports(7687)
+    container.with_kwargs(labels=cgr_container_labels())
     container.waiting_for(LogMessageWaitStrategy("You are running Memgraph"))
 
     container.start()

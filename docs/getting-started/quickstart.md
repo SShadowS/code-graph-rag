@@ -10,18 +10,28 @@ Get from zero to querying your codebase in 5 minutes.
 
 Parse and ingest a multi-language repository into the knowledge graph.
 
-**For the first repository (clean start):**
-
 ```bash
-cgr start --repo-path /path/to/repo1 --update-graph --clean
+cgr start --repo-path /path/to/repo1 --update-graph
 ```
 
-**For additional repositories (preserve existing data):**
+**For additional repositories:**
 
 ```bash
 cgr start --repo-path /path/to/repo2 --update-graph
 cgr start --repo-path /path/to/repo3 --update-graph
 ```
+
+The graph is shared across projects, and syncing one leaves the others intact.
+
+**To start over from an empty graph:**
+
+```bash
+cgr start --repo-path /path/to/repo1 --update-graph --clean
+```
+
+`--clean` deletes **every** project in the shared graph, not just the one named
+by `--repo-path`. It asks for confirmation when other projects would be lost;
+pass `--yes` to skip that prompt in scripts and CI.
 
 **Control Memgraph batch flushing:**
 
@@ -43,14 +53,14 @@ cgr start --repo-path /path/to/your/repo
 
 ```bash
 cgr start --repo-path /path/to/your/repo \
-  --orchestrator ollama:llama3.2 \
-  --cypher ollama:codellama
+  --orchestrator ollama:qwen2.5-coder \
+  --cypher ollama:qwen2.5-coder
 ```
 
 ```bash
 cgr start --repo-path /path/to/your/repo \
-  --orchestrator google:gemini-2.0-flash-thinking-exp-01-21 \
-  --cypher google:gemini-2.5-flash-lite-preview-06-17
+  --orchestrator google:gemini-3.6-flash \
+  --cypher google:gemini-3.5-flash-lite
 ```
 
 **Example queries:**
@@ -69,7 +79,7 @@ cgr start --repo-path /path/to/your/repo \
 **Export during graph update:**
 
 ```bash
-cgr start --repo-path /path/to/repo --update-graph --clean -o my_graph.json
+cgr start --repo-path /path/to/repo --update-graph -o my_graph.json
 ```
 
 **Export existing graph without updating:**
@@ -98,6 +108,6 @@ for func in functions[:5]:
 
 - [CLI Reference](../guide/cli-reference.md) for all available commands
 - [Interactive Querying](../guide/interactive-querying.md) for query examples
-- [Code Optimization](../guide/code-optimization.md) for AI-powered improvements
+- [Code Optimisation](../guide/code-optimization.md) for AI-powered improvements
 - [MCP Server](../guide/mcp-server.md) for Claude Code integration
 - [Python SDK](../sdk/overview.md) for programmatic access

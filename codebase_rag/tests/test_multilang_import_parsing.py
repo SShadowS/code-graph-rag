@@ -5,6 +5,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from codebase_rag.graph_updater import GraphUpdater
 from codebase_rag.parser_loader import load_parsers
 
@@ -29,7 +31,8 @@ function main() {
         test_file.write_text(encoding="utf-8", data=test_code)
 
         parsers, queries = load_parsers()
-        assert "javascript" in parsers, "JavaScript parser not available"
+        if "javascript" not in parsers:
+            pytest.skip("javascript parser not available")
 
         mock_ingestor = MagicMock()
         updater = GraphUpdater(
@@ -84,7 +87,7 @@ public class Test {
 
         parsers, queries = load_parsers()
         if "java" not in parsers:
-            return
+            pytest.skip("java parser not available")
 
         mock_ingestor = MagicMock()
         updater = GraphUpdater(
@@ -137,7 +140,7 @@ fn main() {
 
         parsers, queries = load_parsers()
         if "rust" not in parsers:
-            return
+            pytest.skip("rust parser not available")
 
         mock_ingestor = MagicMock()
         updater = GraphUpdater(
@@ -157,11 +160,13 @@ fn main() {
         )
         actual_imports = updater.factory.import_processor.import_mapping[test_module]
 
+        # Local (crate::) targets are rewritten to project qns at parse time
+        # (issue #1007); external targets keep their raw `::` path.
         expected = {
             "HashMap": "std::collections::HashMap",
             "fs": "std::fs",
             "io": "std::io",
-            "*crate::utils": "crate::utils",
+            "*crate::utils": f"{project_name}.utils",
             "Map": "std::collections::HashMap",
         }
 
@@ -204,7 +209,7 @@ fn main() {
 
         parsers, queries = load_parsers()
         if "rust" not in parsers:
-            return
+            pytest.skip("rust parser not available")
 
         mock_ingestor = MagicMock()
         updater = GraphUpdater(
@@ -224,20 +229,27 @@ fn main() {
         )
         actual_imports = updater.factory.import_processor.import_mapping[test_module]
 
+        # External targets keep their raw `::` path; crate::/super::/self::
+        # targets are rewritten to project qns at parse time (issue #1007).
+        # The file module is <project>.test, so one super:: reaches the
+        # project root and further supers floor there.
         expected = {
             "Read": "std::io::Read",
             "Write": "std::io::Write",
             "File": "std::fs::File",
             "Sio": "std::io",
             "ReadTrait": "std::io::Read",
-            "module": "super::super::module",
-            "module1": "crate::module1",
-            "submod1": "crate::module2::submod1",
-            "submod2": "crate::module2::submod2",
-            "local_module": "self::local_module",
-            "parent_module": "super::parent_module",
-            "self": "super",
+            "module": f"{project_name}.module",
+            "module1": f"{project_name}.module1",
+            "submod1": f"{project_name}.module2.submod1",
+            "submod2": f"{project_name}.module2.submod2",
+            "local_module": f"{project_name}.test.local_module",
+            "parent_module": f"{project_name}.parent_module",
         }
+        # `use super::{self, parent_module}` binds the parent module under a
+        # name only its resolved path knows, so the `self` part contributes no
+        # entry; keyed on the keyword it was unreachable anyway (issue #1054).
+        assert "self" not in actual_imports
 
         for name, path in expected.items():
             assert name in actual_imports, f"Missing import: {name}"
@@ -269,7 +281,7 @@ func main() {
 
         parsers, queries = load_parsers()
         if "go" not in parsers:
-            return
+            pytest.skip("go parser not available")
 
         mock_ingestor = MagicMock()
         updater = GraphUpdater(
@@ -296,3 +308,29 @@ func main() {
             assert actual_imports[name] == path, (
                 f"Wrong path for {name}: expected {path}, got {actual_imports[name]}"
             )
+
+
+def test_go_dot_import_binds_sentinel_not_package_name() -> None:
+    # `import . "fmt"` exposes the package's exported names, NOT the `fmt`
+    # identifier, so only the `.`-prefixed sentinel may be recorded.
+    test_code = 'package main\n\nimport . "fmt"\n\nfunc main() {\n\tPrintln("x")\n}\n'
+    with tempfile.TemporaryDirectory() as temp_dir:
+        test_file = Path(temp_dir) / "test.go"
+        test_file.write_text(encoding="utf-8", data=test_code)
+
+        parsers, queries = load_parsers()
+        if "go" not in parsers:
+            pytest.skip("go parser not available")
+
+        updater = GraphUpdater(
+            ingestor=MagicMock(),
+            repo_path=Path(temp_dir),
+            parsers=parsers,
+            queries=queries,
+        )
+        updater.run()
+
+        module = f"{Path(temp_dir).name}.test"
+        actual = updater.factory.import_processor.import_mapping.get(module, {})
+        assert actual.get(".fmt") == "fmt", actual
+        assert "fmt" not in actual, actual

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from abc import abstractmethod
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loguru import logger
-from tree_sitter import Query, QueryCursor
+from tree_sitter import QueryCursor
 
 from ... import constants as cs
 from ... import logs as lg
@@ -13,12 +14,17 @@ from ...types_defs import (
     ASTNode,
     FunctionRegistryTrieProtocol,
     NodeType,
-    PropertyDict,
     SimpleNameLookup,
 )
-from ..utils import safe_decode_text, safe_decode_with_fallback
+from ..utils import (
+    get_cached_query,
+    module_function_props,
+    safe_decode_text,
+    safe_decode_with_fallback,
+    sorted_captures,
+)
 from .module_system import JsTsModuleSystemMixin
-from .utils import get_js_ts_language_obj
+from .utils import arrow_binding_name, get_js_ts_language_obj
 
 if TYPE_CHECKING:
     from ...language_spec import LanguageSpec
@@ -44,6 +50,19 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
     def _get_docstring(self, node: ASTNode) -> str | None: ...
 
     @abstractmethod
+    def _emit_or_defer_defines(
+        self,
+        parent_label: str,
+        parent_qn: str,
+        child_label: str,
+        child_qn: str,
+        module_qn: str,
+        fallback_label: str | None = None,
+        fallback_qn: str | None = None,
+        parent_span: tuple[str, int, int] | None = None,
+    ) -> None: ...
+
+    @abstractmethod
     def _build_nested_qualified_name(
         self,
         func_node: ASTNode,
@@ -53,12 +72,22 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
         skip_classes: bool = False,
     ) -> str | None: ...
 
+    @abstractmethod
+    def _determine_function_parent(
+        self,
+        func_node: ASTNode,
+        func_qn: str,
+        module_qn: str,
+        lang_config: LanguageSpec,
+        language: cs.SupportedLanguage | None = None,
+    ) -> tuple[str, str, tuple[str, int, int] | None]: ...
+
     def _ingest_prototype_inheritance(
         self,
         root_node: ASTNode,
         module_qn: str,
         language: cs.SupportedLanguage,
-        queries: dict[cs.SupportedLanguage, LanguageQueries],
+        queries: Mapping[cs.SupportedLanguage, LanguageQueries],
     ) -> None:
         if language not in cs.JS_TS_LANGUAGES:
             return
@@ -76,7 +105,7 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
         root_node: ASTNode,
         module_qn: str,
         language: cs.SupportedLanguage,
-        queries: dict[cs.SupportedLanguage, LanguageQueries],
+        queries: Mapping[cs.SupportedLanguage, LanguageQueries],
     ) -> None:
         lang_queries = queries[language]
 
@@ -94,9 +123,9 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
     def _process_prototype_inheritance_captures(
         self, language_obj, root_node, module_qn
     ):
-        query = Query(language_obj, cs.JS_PROTOTYPE_INHERITANCE_QUERY)
+        query = get_cached_query(language_obj, cs.JS_PROTOTYPE_INHERITANCE_QUERY)
         cursor = QueryCursor(query)
-        captures = cursor.captures(root_node)
+        captures = sorted_captures(cursor, root_node)
 
         child_classes = captures.get(cs.CAPTURE_CHILD_CLASS, [])
         parent_classes = captures.get(cs.CAPTURE_PARENT_CLASS, [])
@@ -131,7 +160,7 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
         root_node: ASTNode,
         module_qn: str,
         language: cs.SupportedLanguage,
-        queries: dict[cs.SupportedLanguage, LanguageQueries],
+        queries: Mapping[cs.SupportedLanguage, LanguageQueries],
     ) -> None:
         lang_queries = queries[language]
 
@@ -140,14 +169,47 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
             return
 
         try:
-            self._process_prototype_method_captures(language_obj, root_node, module_qn)
+            self._process_prototype_method_captures(
+                language_obj,
+                root_node,
+                module_qn,
+                lang_queries.get(cs.QUERY_CONFIG),
+                language,
+            )
         except Exception as e:
             logger.debug(lg.JS_PROTOTYPE_METHODS_FAILED, error=e)
 
-    def _process_prototype_method_captures(self, language_obj, root_node, module_qn):
-        method_query = Query(language_obj, cs.JS_PROTOTYPE_METHOD_QUERY)
+    def _lexical_defines_fallback(
+        self,
+        func_node: ASTNode,
+        child_qn: str,
+        module_qn: str,
+        lang_config: LanguageSpec | None,
+        language: cs.SupportedLanguage,
+    ) -> tuple[str | None, str | None]:
+        # The lexical enclosing function of a specially-ingested function
+        # (prototype assignment, object-literal property): the true parent when
+        # nested, None at top level where module parenting is already correct.
+        if lang_config is None:
+            return None, None
+        parent_label, parent_qn, _ = self._determine_function_parent(
+            func_node, child_qn, module_qn, lang_config, language
+        )
+        if str(parent_label) == cs.NodeLabel.MODULE.value:
+            return None, None
+        return str(parent_label), parent_qn
+
+    def _process_prototype_method_captures(
+        self,
+        language_obj,
+        root_node,
+        module_qn,
+        lang_config: LanguageSpec | None = None,
+        language: cs.SupportedLanguage = cs.SupportedLanguage.JS,
+    ):
+        method_query = get_cached_query(language_obj, cs.JS_PROTOTYPE_METHOD_QUERY)
         method_cursor = QueryCursor(method_query)
-        method_captures = method_cursor.captures(root_node)
+        method_captures = sorted_captures(method_cursor, root_node)
 
         constructor_names = method_captures.get(cs.CAPTURE_CONSTRUCTOR_NAME, [])
         method_names = method_captures.get(cs.CAPTURE_METHOD_NAME, [])
@@ -164,14 +226,20 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
             if constructor_name and method_name:
                 constructor_qn = f"{module_qn}{cs.SEPARATOR_DOT}{constructor_name}"
                 method_qn = f"{constructor_qn}{cs.SEPARATOR_DOT}{method_name}"
+                if self._span_claimed_for_qn(module_qn, func_node, method_qn):
+                    continue
+                method_qn = self.function_registry.register_unique_qn(
+                    method_qn, func_node.start_point[0] + 1, func_node.start_point[1]
+                )
 
-                method_props: PropertyDict = {
-                    cs.KEY_QUALIFIED_NAME: method_qn,
-                    cs.KEY_NAME: method_name,
-                    cs.KEY_START_LINE: func_node.start_point[0] + 1,
-                    cs.KEY_END_LINE: func_node.end_point[0] + 1,
-                    cs.KEY_DOCSTRING: self._get_docstring(func_node),
-                }
+                method_props = module_function_props(
+                    method_qn,
+                    method_name,
+                    func_node,
+                    self._get_docstring(func_node),
+                    self.module_qn_to_file_path.get(module_qn),
+                    self.repo_path,
+                )
                 logger.info(
                     lg.JS_PROTOTYPE_METHOD_FOUND,
                     method_name=method_name,
@@ -181,11 +249,26 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
 
                 self.function_registry[method_qn] = NodeType.FUNCTION
                 self.simple_name_lookup[method_name].add(method_qn)
+                self._claim_function_span(
+                    module_qn, func_node, cs.NodeLabel.FUNCTION.value, method_qn
+                )
 
-                self.ingestor.ensure_relationship_batch(
-                    (cs.NodeLabel.FUNCTION, cs.KEY_QUALIFIED_NAME, constructor_qn),
-                    cs.RelationshipType.DEFINES,
-                    (cs.NodeLabel.FUNCTION, cs.KEY_QUALIFIED_NAME, method_qn),
+                # The assignment target is not always a registered constructor:
+                # `target.prototype.render = ...` inside a decorator names a
+                # parameter, so the parent qn would be a phantom the database drops.
+                # Defer so it verifies against the registry, and prefer the lexical
+                # enclosing function over the module when the guess never registers.
+                fallback_label, fallback_qn = self._lexical_defines_fallback(
+                    func_node, method_qn, module_qn, lang_config, language
+                )
+                self._emit_or_defer_defines(
+                    cs.NodeLabel.FUNCTION,
+                    constructor_qn,
+                    cs.NodeLabel.FUNCTION,
+                    method_qn,
+                    module_qn,
+                    fallback_label=fallback_label,
+                    fallback_qn=fallback_qn,
                 )
 
                 logger.debug(
@@ -199,7 +282,7 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
         root_node: ASTNode,
         module_qn: str,
         language: cs.SupportedLanguage,
-        queries: dict[cs.SupportedLanguage, LanguageQueries],
+        queries: Mapping[cs.SupportedLanguage, LanguageQueries],
     ) -> None:
         language_obj = get_js_ts_language_obj(language, queries)
         if not language_obj:
@@ -209,7 +292,12 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
         try:
             for query_text in [cs.JS_OBJECT_METHOD_QUERY, cs.JS_METHOD_DEF_QUERY]:
                 self._process_object_method_query(
-                    language_obj, query_text, root_node, module_qn, lang_config
+                    language_obj,
+                    query_text,
+                    root_node,
+                    module_qn,
+                    lang_config,
+                    language,
                 )
         except Exception as e:
             logger.debug(lg.JS_OBJECT_METHODS_DETECT_FAILED, error=e)
@@ -221,11 +309,12 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
         root_node: ASTNode,
         module_qn: str,
         lang_config,
+        language: cs.SupportedLanguage,
     ) -> None:
         try:
-            query = Query(language_obj, query_text)
+            query = get_cached_query(language_obj, query_text)
             cursor = QueryCursor(query)
-            captures = cursor.captures(root_node)
+            captures = sorted_captures(cursor, root_node)
 
             method_names = captures.get(cs.CAPTURE_METHOD_NAME, [])
             method_functions = captures.get(cs.CAPTURE_METHOD_FUNCTION, [])
@@ -246,7 +335,7 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
                 if not method_func_node:
                     continue
                 self._process_single_object_method(
-                    method_name_node, method_func_node, module_qn, lang_config
+                    method_name_node, method_func_node, module_qn, lang_config, language
                 )
         except Exception as e:
             logger.debug(lg.JS_OBJECT_METHODS_PROCESS_FAILED, error=e)
@@ -257,6 +346,7 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
         method_func_node: ASTNode,
         module_qn: str,
         lang_config,
+        language: cs.SupportedLanguage,
     ) -> None:
         if not method_name_node.text or not method_func_node:
             return
@@ -275,7 +365,7 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
         )
 
         self._register_object_method(
-            method_name, method_qn, method_func_node, module_qn
+            method_name, method_qn, method_func_node, module_qn, lang_config, language
         )
 
     def _resolve_object_method_qn(
@@ -304,14 +394,24 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
         method_qn: str,
         method_func_node: ASTNode,
         module_qn: str,
+        lang_config: LanguageSpec | None,
+        language: cs.SupportedLanguage,
     ) -> None:
-        method_props: PropertyDict = {
-            cs.KEY_QUALIFIED_NAME: method_qn,
-            cs.KEY_NAME: method_name,
-            cs.KEY_START_LINE: method_func_node.start_point[0] + 1,
-            cs.KEY_END_LINE: method_func_node.end_point[0] + 1,
-            cs.KEY_DOCSTRING: self._get_docstring(method_func_node),
-        }
+        if self._span_claimed_for_qn(module_qn, method_func_node, method_qn):
+            return
+        method_qn = self.function_registry.register_unique_qn(
+            method_qn,
+            method_func_node.start_point[0] + 1,
+            method_func_node.start_point[1],
+        )
+        method_props = module_function_props(
+            method_qn,
+            method_name,
+            method_func_node,
+            self._get_docstring(method_func_node),
+            self.module_qn_to_file_path.get(module_qn),
+            self.repo_path,
+        )
         logger.info(
             lg.JS_OBJECT_METHOD_FOUND, method_name=method_name, method_qn=method_qn
         )
@@ -319,19 +419,37 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
 
         self.function_registry[method_qn] = NodeType.FUNCTION
         self.simple_name_lookup[method_name].add(method_qn)
-
-        self.ingestor.ensure_relationship_batch(
-            (cs.NodeLabel.MODULE, cs.KEY_QUALIFIED_NAME, module_qn),
-            cs.RelationshipType.DEFINES,
-            (cs.NodeLabel.FUNCTION, cs.KEY_QUALIFIED_NAME, method_qn),
+        self._claim_function_span(
+            module_qn, method_func_node, cs.NodeLabel.FUNCTION.value, method_qn
         )
+
+        # An object-literal function nested inside another function takes its
+        # lexical parent, not the module (else module-parented duplicates of
+        # correctly-parented nodes on thrift lib/js).
+        fallback_label, fallback_qn = self._lexical_defines_fallback(
+            method_func_node, method_qn, module_qn, lang_config, language
+        )
+        if fallback_label is not None and fallback_qn is not None:
+            self._emit_or_defer_defines(
+                fallback_label,
+                fallback_qn,
+                cs.NodeLabel.FUNCTION,
+                method_qn,
+                module_qn,
+            )
+        else:
+            self.ingestor.ensure_relationship_batch(
+                (cs.NodeLabel.MODULE, cs.KEY_QUALIFIED_NAME, module_qn),
+                cs.RelationshipType.DEFINES,
+                (cs.NodeLabel.FUNCTION, cs.KEY_QUALIFIED_NAME, method_qn),
+            )
 
     def _ingest_assignment_arrow_functions(
         self,
         root_node: ASTNode,
         module_qn: str,
         language: cs.SupportedLanguage,
-        queries: dict[cs.SupportedLanguage, LanguageQueries],
+        queries: Mapping[cs.SupportedLanguage, LanguageQueries],
     ) -> None:
         if language not in cs.JS_TS_LANGUAGES:
             return
@@ -346,7 +464,7 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
                 cs.JS_ASSIGNMENT_FUNCTION_QUERY,
             ]:
                 self._process_arrow_query(
-                    lang_query, query_text, root_node, module_qn, lang_config
+                    lang_query, query_text, root_node, module_qn, lang_config, language
                 )
         except Exception as e:
             logger.debug(lg.JS_ASSIGNMENT_ARROW_DETECT_FAILED, error=e)
@@ -358,11 +476,12 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
         root_node: ASTNode,
         module_qn: str,
         lang_config,
+        language: cs.SupportedLanguage,
     ) -> None:
         try:
-            query = Query(lang_query, query_text)
+            query = get_cached_query(lang_query, query_text)
             cursor = QueryCursor(query)
-            captures = cursor.captures(root_node)
+            captures = sorted_captures(cursor, root_node)
 
             method_names = captures.get(cs.CAPTURE_METHOD_NAME, [])
             member_exprs = captures.get(cs.CAPTURE_MEMBER_EXPR, [])
@@ -370,7 +489,7 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
             function_exprs = captures.get(cs.CAPTURE_FUNCTION_EXPR, [])
 
             self._process_direct_arrow_functions(
-                method_names, arrow_functions, module_qn, lang_config
+                method_names, arrow_functions, module_qn, lang_config, language
             )
             self._process_member_expr_functions(
                 member_exprs,
@@ -378,6 +497,7 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
                 module_qn,
                 lang_config,
                 lg.JS_ASSIGNMENT_ARROW_FOUND,
+                language,
             )
             self._process_member_expr_functions(
                 member_exprs,
@@ -385,6 +505,7 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
                 module_qn,
                 lang_config,
                 lg.JS_ASSIGNMENT_FUNC_EXPR_FOUND,
+                language,
             )
         except Exception as e:
             logger.debug(lg.JS_ASSIGNMENT_ARROW_QUERY_FAILED, error=e)
@@ -395,6 +516,7 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
         arrow_functions: list[ASTNode],
         module_qn: str,
         lang_config,
+        language: cs.SupportedLanguage,
     ) -> None:
         for method_name, arrow_function in zip(method_names, arrow_functions):
             if not method_name.text or not arrow_function:
@@ -409,7 +531,13 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
             )
 
             self._register_arrow_function(
-                function_name, function_qn, arrow_function, lg.JS_OBJECT_ARROW_FOUND
+                function_name,
+                function_qn,
+                arrow_function,
+                module_qn,
+                lg.JS_OBJECT_ARROW_FOUND,
+                lang_config,
+                language,
             )
 
     def _resolve_direct_arrow_qn(
@@ -454,6 +582,7 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
         module_qn: str,
         lang_config,
         log_message: str,
+        language: cs.SupportedLanguage,
     ) -> None:
         for member_expr, function_node in zip(member_exprs, function_nodes):
             if not member_expr.text or not function_node:
@@ -463,13 +592,25 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
             if cs.SEPARATOR_DOT not in member_text:
                 continue
 
+            # `X.prototype.y = function` is handled by the dedicated prototype-method
+            # path (constructor-parented qn `X.y`); registering it here too minted a
+            # SECOND node under a module-anchored qn for the same function.
+            if cs.SEPARATOR_PROTOTYPE in member_text:
+                continue
+
             function_name = member_text.split(cs.SEPARATOR_DOT)[-1]
             function_qn = self._resolve_member_expr_qn(
                 member_expr, function_node, module_qn, function_name, lang_config
             )
 
             self._register_arrow_function(
-                function_name, function_qn, function_node, log_message
+                function_name,
+                function_qn,
+                function_node,
+                module_qn,
+                log_message,
+                lang_config,
+                language,
             )
 
     def _resolve_member_expr_qn(
@@ -493,20 +634,52 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
         function_name: str,
         function_qn: str,
         function_node: ASTNode,
+        module_qn: str,
         log_message: str,
+        lang_config: LanguageSpec | None,
+        language: cs.SupportedLanguage,
     ) -> None:
-        function_props: PropertyDict = {
-            cs.KEY_QUALIFIED_NAME: function_qn,
-            cs.KEY_NAME: function_name,
-            cs.KEY_START_LINE: function_node.start_point[0] + 1,
-            cs.KEY_END_LINE: function_node.end_point[0] + 1,
-            cs.KEY_DOCSTRING: self._get_docstring(function_node),
-        }
+        if self._span_claimed_for_qn(module_qn, function_node, function_qn):
+            return
+        function_qn = self.function_registry.register_unique_qn(
+            function_qn, function_node.start_point[0] + 1, function_node.start_point[1]
+        )
+        function_props = module_function_props(
+            function_qn,
+            function_name,
+            function_node,
+            self._get_docstring(function_node),
+            self.module_qn_to_file_path.get(module_qn),
+            self.repo_path,
+        )
 
         logger.debug(log_message, function_name=function_name, function_qn=function_qn)
         self.ingestor.ensure_node_batch(cs.NodeLabel.FUNCTION, function_props)
         self.function_registry[function_qn] = NodeType.FUNCTION
         self.simple_name_lookup[function_name].add(function_qn)
+        self._claim_function_span(
+            module_qn, function_node, cs.NodeLabel.FUNCTION.value, function_qn
+        )
+        # An assignment function nested inside another function takes its lexical
+        # parent, not the module (else module-parented duplicates of
+        # correctly-parented nodes on thrift lib/js).
+        fallback_label, fallback_qn = self._lexical_defines_fallback(
+            function_node, function_qn, module_qn, lang_config, language
+        )
+        if fallback_label is not None and fallback_qn is not None:
+            self._emit_or_defer_defines(
+                fallback_label,
+                fallback_qn,
+                cs.NodeLabel.FUNCTION,
+                function_qn,
+                module_qn,
+            )
+        else:
+            self.ingestor.ensure_relationship_batch(
+                (cs.NodeLabel.MODULE, cs.KEY_QUALIFIED_NAME, module_qn),
+                cs.RelationshipType.DEFINES,
+                (cs.NodeLabel.FUNCTION, cs.KEY_QUALIFIED_NAME, function_qn),
+            )
 
     def _is_static_method_in_class(self, method_node: ASTNode) -> bool:
         if method_node.type == cs.TS_METHOD_DEFINITION:
@@ -618,7 +791,39 @@ class JsTsIngestMixin(JsTsModuleSystemMixin):
             return None
 
         name_node = node.child_by_field_name(cs.FIELD_NAME)
-        return safe_decode_text(name_node) if name_node and name_node.text else None
+        if name_node and name_node.text:
+            return safe_decode_text(name_node)
+        return self._js_nameless_binding_name(node)
+
+    def _js_nameless_binding_name(self, node: ASTNode) -> str | None:
+        # An arrow/function-expression has no `name` field; its effective name is
+        # the binding it is assigned to (const Cmp = () => {}), the object key it is
+        # a value of, or the lhs of an assignment. Recovering it keeps a callback
+        # under its arrow-const component (module.Cmp.onSuccess), consistent with the
+        # call pass, instead of collapsing to module.onSuccess and dangling.
+        # The value-bound forms (`const f = () => ...` declarator and a class
+        # field `create = (s) => ...`), including through paren/cast wrappers
+        # (`create = ((s) => ...) as Create`), share the call pass's helper so a
+        # callback in the arrow body attributes to `scope.create.cb` in lock-step
+        # with the caller qn; without this a class arrow-property factory drops
+        # the property scope and its callbacks report dead.
+        if name := arrow_binding_name(node):
+            return name
+        parent = node.parent
+        if parent is None:
+            return None
+        if parent.type == cs.TS_PAIR:
+            binding = parent.child_by_field_name(cs.FIELD_KEY)
+        elif parent.type == cs.TS_ASSIGNMENT_EXPRESSION:
+            binding = parent.child_by_field_name(cs.FIELD_LEFT)
+        else:
+            return None
+        if binding is None or binding.type not in (
+            cs.TS_IDENTIFIER,
+            cs.TS_PROPERTY_IDENTIFIER,
+        ):
+            return None
+        return safe_decode_text(binding) if binding.text else None
 
     def _js_format_qualified_name(
         self, module_qn: str, path_parts: list[str], final_name: str

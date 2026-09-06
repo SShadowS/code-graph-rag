@@ -264,6 +264,61 @@ class CsprojParser(DependencyParser):
         return dependencies
 
 
+class PubspecYamlParser(DependencyParser):
+    __slots__ = ()
+
+    def parse(self, file_path: Path) -> list[Dependency]:
+        # pubspec.yaml is flat enough that a line scanner beats adding a YAML
+        # dependency: track the current top-level key by zero indentation and
+        # collect the `name: spec` lines under dependencies blocks. The block's
+        # entry indent is whatever the FIRST entry uses, so packages are lines at
+        # exactly that indent; deeper lines are a nested block's keys (`sdk:`,
+        # `git:`, `path:`) and are skipped. A nested block's parent key
+        # (`flutter:`) has no inline scalar, so it is recorded name-only
+        # (spec = "").
+        dependencies: list[Dependency] = []
+        try:
+            scanner = _PubspecScanner()
+            with open(file_path, encoding=cs.ENCODING_UTF8) as f:
+                for raw in f:
+                    if (dependency := scanner.feed(raw.rstrip())) is not None:
+                        dependencies.append(dependency)
+        except Exception as e:
+            logger.error(ls.DEP_PARSE_ERROR_PUBSPEC.format(path=file_path, error=e))
+        return dependencies
+
+
+class _PubspecScanner:
+    """The line-by-line state of `PubspecYamlParser.parse`: which top-level
+    block the scan is in, and the indent its entries use."""
+
+    __slots__ = ("entry_indent", "in_deps")
+
+    def __init__(self) -> None:
+        self.in_deps = False
+        self.entry_indent: int | None = None
+
+    def feed(self, line: str) -> Dependency | None:
+        if not line or line.lstrip().startswith(cs.PUBSPEC_COMMENT_PREFIX):
+            return None
+        indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+        if indent == 0:
+            key = stripped.split(cs.PUBSPEC_KEY_SEP, 1)[0]
+            self.in_deps = key in cs.PUBSPEC_DEP_KEYS
+            self.entry_indent = None
+            return None
+        if not self.in_deps or cs.PUBSPEC_KEY_SEP not in stripped:
+            return None
+        if self.entry_indent is None:
+            self.entry_indent = indent
+        if indent != self.entry_indent:
+            return None
+        name, _, spec = stripped.partition(cs.PUBSPEC_KEY_SEP)
+        name = name.strip()
+        return Dependency(name, spec.strip()) if name else None
+
+
 def parse_dependencies(file_path: Path) -> list[Dependency]:
     file_name = file_path.name.lower()
 
@@ -282,6 +337,8 @@ def parse_dependencies(file_path: Path) -> list[Dependency]:
             return GemfileParser().parse(file_path)
         case cs.DEP_FILE_COMPOSER:
             return ComposerJsonParser().parse(file_path)
+        case cs.DEP_FILE_PUBSPEC:
+            return PubspecYamlParser().parse(file_path)
         case _ if file_path.suffix.lower() == cs.CSPROJ_SUFFIX:
             return CsprojParser().parse(file_path)
         case _:

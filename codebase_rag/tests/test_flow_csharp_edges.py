@@ -1,0 +1,348 @@
+# C# FLOWS_TO taint edges (issue #102 follow-up). C# had READS_FROM/WRITES_TO
+# sinks (#825) and resource handles (#826) but no data-flow taint: a value read
+# from one resource reaching a write sink emits a resource->resource FLOWS_TO.
+# The lean flow walk is descriptor-driven and already ran for C#, but C# wraps
+# every call argument in an `argument` node, so the sink-argument taint reader
+# and the literal-identity resolver had to unwrap it.
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock
+
+from codebase_rag import constants as cs
+from codebase_rag.capture import resolve_capture
+from codebase_rag.graph_updater import GraphUpdater
+from codebase_rag.parser_loader import load_parsers
+
+FLOWS_TO = cs.RelationshipType.FLOWS_TO.value
+_CAPTURE_IO = resolve_capture([cs.CaptureGroup.IO.value])
+
+
+def _run_flow(tmp_path: Path, files: dict[str, str]) -> set[tuple[str, str]]:
+    parsers, queries = load_parsers()
+    for rel, content in files.items():
+        (tmp_path / rel).write_text(content, encoding="utf-8")
+    mock = MagicMock()
+    GraphUpdater(
+        ingestor=mock,
+        repo_path=tmp_path,
+        parsers=parsers,
+        queries=queries,
+        capture=_CAPTURE_IO,
+    ).run()
+    return {
+        (c.args[0][2], c.args[2][2])
+        for c in mock.ensure_relationship_batch.call_args_list
+        if str(c.args[1]) == FLOWS_TO
+    }
+
+
+def test_csharp_env_flows_to_file_via_variable(tmp_path: Path) -> None:
+    files = {
+        "A.cs": (
+            "using System;\n"
+            "using System.IO;\n"
+            "class A {\n"
+            "  void Leak() {\n"
+            '    string s = Environment.GetEnvironmentVariable("SECRET");\n'
+            '    File.WriteAllText("out.txt", s);\n'
+            "  }\n"
+            "}\n"
+        )
+    }
+    flows = _run_flow(tmp_path, files)
+    assert ("resource::ENV::SECRET", "resource::FILE::out.txt") in flows, flows
+
+
+def test_csharp_env_flows_to_file_inline(tmp_path: Path) -> None:
+    # The read source is inlined as the write sink's argument (no variable).
+    files = {
+        "A.cs": (
+            "using System;\n"
+            "using System.IO;\n"
+            "class A {\n"
+            "  void Leak() {\n"
+            '    File.WriteAllText("out.txt", '
+            'Environment.GetEnvironmentVariable("SECRET"));\n'
+            "  }\n"
+            "}\n"
+        )
+    }
+    flows = _run_flow(tmp_path, files)
+    assert ("resource::ENV::SECRET", "resource::FILE::out.txt") in flows, flows
+
+
+def test_csharp_env_flows_to_stdout(tmp_path: Path) -> None:
+    files = {
+        "A.cs": (
+            "using System;\n"
+            "class A {\n"
+            "  void Log() {\n"
+            '    string k = Environment.GetEnvironmentVariable("KEY");\n'
+            "    Console.WriteLine(k);\n"
+            "  }\n"
+            "}\n"
+        )
+    }
+    flows = _run_flow(tmp_path, files)
+    assert ("resource::ENV::KEY", "resource::STDOUT::<dynamic>") in flows, flows
+
+
+def test_csharp_file_read_flows_to_file_write(tmp_path: Path) -> None:
+    files = {
+        "A.cs": (
+            "using System.IO;\n"
+            "class A {\n"
+            "  void Copy() {\n"
+            '    string data = File.ReadAllText("in.txt");\n'
+            '    File.WriteAllText("out.txt", data);\n'
+            "  }\n"
+            "}\n"
+        )
+    }
+    flows = _run_flow(tmp_path, files)
+    assert ("resource::FILE::in.txt", "resource::FILE::out.txt") in flows, flows
+
+
+def test_csharp_untainted_value_emits_no_flow(tmp_path: Path) -> None:
+    # A literal argument carries no taint: no FLOWS_TO edge.
+    files = {
+        "A.cs": (
+            "using System.IO;\n"
+            "class A {\n"
+            "  void Save() {\n"
+            '    File.WriteAllText("out.txt", "constant");\n'
+            "  }\n"
+            "}\n"
+        )
+    }
+    flows = _run_flow(tmp_path, files)
+    assert flows == set(), flows
+
+
+_ENV_K = "resource::ENV::K"
+_STDOUT = "resource::STDOUT::<dynamic>"
+_AWAIT_PLUMBING = (
+    "using System;\nusing System.Threading.Tasks;\n\n"
+    "public class Leaky\n{\n"
+    "    private async Task<string> FetchAsync()\n    {\n"
+    "        await Task.Delay(1);\n"
+    '        return Environment.GetEnvironmentVariable("K");\n    }\n\n'
+    "    public async Task Run()\n    {\n"
+    "        var token = await FetchAsync().ConfigureAwait(false);\n"
+    "        Console.WriteLine(token);\n    }\n}\n"
+)
+
+
+def test_configure_await_preserves_taint(tmp_path: Path) -> None:
+    # `ConfigureAwait` returns the SAME value in a different wrapper. Without it
+    # in the transparent set the walk stops at the receiver and a very common
+    # library-code shape loses its edge entirely (issue #1187).
+    flows = _run_flow(tmp_path, {"Program.cs": _AWAIT_PLUMBING})
+    assert (_ENV_K, _STDOUT) in flows
+
+
+def test_await_plumbing_chain_preserves_taint(tmp_path: Path) -> None:
+    # The blocking form of the same plumbing: GetAwaiter().GetResult().
+    source = _AWAIT_PLUMBING.replace(
+        "var token = await FetchAsync().ConfigureAwait(false);",
+        "var token = FetchAsync().GetAwaiter().GetResult();",
+    ).replace("public async Task Run()", "public void Run()")
+    flows = _run_flow(tmp_path, {"Program.cs": source})
+    assert (_ENV_K, _STDOUT) in flows
+
+
+def test_terminal_method_on_a_tainted_receiver_emits_no_flow(tmp_path: Path) -> None:
+    # The guard on the other side: a method that does NOT return the receiver's
+    # value must not propagate taint, or the transparent set becomes a blanket
+    # "any method preserves taint" rule.
+    source = (
+        "using System;\n\n"
+        "public class Fine\n{\n"
+        "    public void Run()\n    {\n"
+        '        var token = Environment.GetEnvironmentVariable("K");\n'
+        "        Console.WriteLine(token.Length);\n    }\n}\n"
+    )
+    assert (_ENV_K, _STDOUT) not in _run_flow(tmp_path, {"Program.cs": source})
+
+
+def test_value_task_as_task_preserves_taint(tmp_path: Path) -> None:
+    # `AsTask` converts a ValueTask to a Task without changing the value, so it
+    # belongs in the transparent set for the same reason as ConfigureAwait.
+    source = (
+        "using System;\nusing System.Threading.Tasks;\n\n"
+        "public class Leaky\n{\n"
+        "    private async ValueTask<string> FetchAsync()\n    {\n"
+        "        await Task.Delay(1);\n"
+        '        return Environment.GetEnvironmentVariable("K");\n    }\n\n'
+        "    public async Task Run()\n    {\n"
+        "        var token = await FetchAsync().AsTask();\n"
+        "        Console.WriteLine(token);\n    }\n}\n"
+    )
+    assert (_ENV_K, _STDOUT) in _run_flow(tmp_path, {"Program.cs": source})
+
+
+_TUPLE_SRC = (
+    "using System;\n\n"
+    "public class Leaky\n{{\n"
+    "    public void Run()\n    {{\n"
+    '        var (secret, plain) = (Environment.GetEnvironmentVariable("K"), "clean");\n'
+    "        Console.WriteLine({read});\n    }}\n}}\n"
+)
+
+
+def test_tuple_deconstruction_binds_the_tainted_element(tmp_path: Path) -> None:
+    # A deconstructing declarator carries no name/value field, so the binding
+    # was skipped entirely and every deconstructed name stayed untainted.
+    flows = _run_flow(tmp_path, {"Program.cs": _TUPLE_SRC.format(read="secret")})
+    assert (_ENV_K, _STDOUT) in flows
+
+
+def test_tuple_deconstruction_leaves_the_clean_element_clean(tmp_path: Path) -> None:
+    # The precision half: pattern names and tuple elements pair BY POSITION, so
+    # reading the untainted element must emit nothing. Asserted as the EXACT set
+    # rather than one absent pair, so no other fabricated edge can hide either.
+    flows = _run_flow(tmp_path, {"Program.cs": _TUPLE_SRC.format(read="plain")})
+    assert flows == set()
+
+
+def test_tuple_deconstruction_taints_only_the_matching_position(tmp_path: Path) -> None:
+    # Mirror of the above with the taint in the SECOND slot, so a fix that
+    # simply spread the first value across all names would fail here.
+    source = (
+        "using System;\n\n"
+        "public class Leaky\n{\n"
+        "    public void Run()\n    {\n"
+        '        var (plain, secret) = ("clean", Environment.GetEnvironmentVariable("K"));\n'
+        "        Console.WriteLine(secret);\n"
+        "        Console.Error.WriteLine(plain);\n    }\n}\n"
+    )
+    assert (_ENV_K, _STDOUT) in _run_flow(tmp_path, {"Program.cs": source})
+
+
+def test_nested_deconstruction_binds_the_inner_name(tmp_path: Path) -> None:
+    # `tuple_pattern` nests, and the value nests with it; the pair walk descends
+    # both together so an inner name still takes its own element.
+    source = (
+        "using System;\n\n"
+        "public class Leaky\n{\n"
+        "    public void Run()\n    {\n"
+        '        var (a, (b, c)) = ("clean", (Environment.GetEnvironmentVariable("K"), 1));\n'
+        "        Console.WriteLine(b);\n    }\n}\n"
+    )
+    assert (_ENV_K, _STDOUT) in _run_flow(tmp_path, {"Program.cs": source})
+
+
+def test_nested_deconstruction_keeps_the_outer_clean_name_clean(tmp_path: Path) -> None:
+    source = (
+        "using System;\n\n"
+        "public class Leaky\n{\n"
+        "    public void Run()\n    {\n"
+        '        var (a, (b, c)) = ("clean", (Environment.GetEnvironmentVariable("K"), 1));\n'
+        "        Console.WriteLine(a);\n    }\n}\n"
+    )
+    assert _run_flow(tmp_path, {"Program.cs": source}) == set()
+
+
+def test_typed_deconstruction_assignment_binds(tmp_path: Path) -> None:
+    # `(string a, int b) = (x, y)` is an ASSIGNMENT whose left is a tuple, not a
+    # declarator, so it reaches the pair walk by a different route entirely.
+    source = (
+        "using System;\n\n"
+        "public class Leaky\n{\n"
+        "    public void Run()\n    {\n"
+        '        (string a, int b) = (Environment.GetEnvironmentVariable("K"), 1);\n'
+        "        Console.WriteLine(a);\n    }\n}\n"
+    )
+    assert (_ENV_K, _STDOUT) in _run_flow(tmp_path, {"Program.cs": source})
+
+
+def test_predeclared_deconstruction_assignment_binds(tmp_path: Path) -> None:
+    source = (
+        "using System;\n\n"
+        "public class Leaky\n{\n"
+        "    public void Run()\n    {\n"
+        "        string a; int b;\n"
+        '        (a, b) = (Environment.GetEnvironmentVariable("K"), 1);\n'
+        "        Console.WriteLine(a);\n    }\n}\n"
+    )
+    assert (_ENV_K, _STDOUT) in _run_flow(tmp_path, {"Program.cs": source})
+
+
+def test_discard_slot_consumes_its_position(tmp_path: Path) -> None:
+    # `_` binds nothing, but it must still CONSUME its slot or every later name
+    # would pair with the wrong element.
+    source = (
+        "using System;\n\n"
+        "public class Leaky\n{\n"
+        "    public void Run()\n    {\n"
+        '        var (_, secret) = ("clean", Environment.GetEnvironmentVariable("K"));\n'
+        "        Console.WriteLine(secret);\n    }\n}\n"
+    )
+    assert (_ENV_K, _STDOUT) in _run_flow(tmp_path, {"Program.cs": source})
+
+
+def test_is_pattern_binds_the_tested_value(tmp_path: Path) -> None:
+    # `o is string s` guarantees `s` IS the tested value, so it inherits its
+    # taint; without this the bound name reads as clean inside the very branch
+    # that established what it is.
+    source = (
+        "using System;\n\n"
+        "public class Leaky\n{\n"
+        "    public void Run()\n    {\n"
+        '        object o = Environment.GetEnvironmentVariable("K");\n'
+        "        if (o is string s)\n        {\n"
+        "            Console.WriteLine(s);\n        }\n    }\n}\n"
+    )
+    assert (_ENV_K, _STDOUT) in _run_flow(tmp_path, {"Program.cs": source})
+
+
+def test_is_pattern_on_a_clean_subject_emits_no_flow(tmp_path: Path) -> None:
+    # The guard: the binding must carry the SUBJECT's taint, not simply mark
+    # every pattern-bound name as tainted.
+    source = (
+        "using System;\n\n"
+        "public class Fine\n{\n"
+        "    public void Run()\n    {\n"
+        '        object o = "constant";\n'
+        "        if (o is string s)\n        {\n"
+        "            Console.WriteLine(s);\n        }\n    }\n}\n"
+    )
+    assert _run_flow(tmp_path, {"Program.cs": source}) == set()
+
+
+def test_is_pattern_without_a_binding_is_ignored(tmp_path: Path) -> None:
+    # `o is string` binds nothing, so there is no name to taint and the walk
+    # must not fall over reaching for one.
+    source = (
+        "using System;\n\n"
+        "public class Fine\n{\n"
+        "    public void Run()\n    {\n"
+        '        object o = Environment.GetEnvironmentVariable("K");\n'
+        "        if (o is string)\n        {\n"
+        '            Console.WriteLine("safe");\n        }\n    }\n}\n'
+    )
+    assert (_ENV_K, _STDOUT) not in _run_flow(tmp_path, {"Program.cs": source})
+
+
+def test_call_subject_of_a_pattern_still_emits_its_own_flows(tmp_path: Path) -> None:
+    # The tested subject can be a CALL, and binding the pattern name must not
+    # suppress walking it: `Forward` writes its argument to stderr, so that
+    # edge has to survive alongside the pattern binding.
+    source = (
+        "using System;\n\n"
+        "public class Leaky\n{\n"
+        "    private string Forward(string v)\n    {\n"
+        "        Console.Error.WriteLine(v);\n        return v;\n    }\n\n"
+        "    public void Run()\n    {\n"
+        '        var secret = Environment.GetEnvironmentVariable("K");\n'
+        "        if (Forward(secret) is string s)\n        {\n"
+        "            Console.WriteLine(s);\n        }\n    }\n}\n"
+    )
+    flows = _run_flow(tmp_path, {"Program.cs": source})
+    assert (_ENV_K, "resource::STDERR::<dynamic>") in flows
+    # NOT asserted: ENV -> STDOUT via `s`. A call subject does not carry its
+    # RETURN taint to the bound name, but that is a pre-existing pass-through
+    # limitation, not a pattern one -- `var t = Forward(secret); sink(t);`
+    # emits no edge either. Asserting it here would tie this test to a gap it
+    # does not own.

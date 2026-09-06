@@ -157,16 +157,25 @@ class StdlibExtractor:
         match language:
             case cs.SupportedLanguage.PYTHON:
                 return self._extract_python_stdlib_path(full_qualified_name)
-            case cs.SupportedLanguage.JS | cs.SupportedLanguage.TS:
+            case (
+                cs.SupportedLanguage.JS
+                | cs.SupportedLanguage.TS
+                | cs.SupportedLanguage.TSX
+            ):
                 return self._extract_js_stdlib_path(full_qualified_name)
             case cs.SupportedLanguage.GO:
                 return self._extract_go_stdlib_path(full_qualified_name)
             case cs.SupportedLanguage.RUST:
                 return self._extract_rust_stdlib_path(full_qualified_name)
-            case cs.SupportedLanguage.CPP:
+            # C shares the include grammar: the same CPP-only arm that hid a
+            # `.c` file's includes upstream (issue #1654) would send its system
+            # includes through the generic extractor here instead.
+            case cs.SupportedLanguage.CPP | cs.SupportedLanguage.C:
                 return self._extract_cpp_stdlib_path(full_qualified_name)
             case cs.SupportedLanguage.JAVA:
                 return self._extract_java_stdlib_path(full_qualified_name)
+            case cs.SupportedLanguage.CSHARP:
+                return self._extract_csharp_stdlib_path(full_qualified_name)
             case cs.SupportedLanguage.LUA:
                 return self._extract_lua_stdlib_path(full_qualified_name)
             case _:
@@ -307,6 +316,7 @@ class StdlibExtractor:
                     check=False,
                     capture_output=True,
                     text=True,
+                    encoding=cs.ENCODING_UTF8,
                     timeout=5,
                     env=env,
                 )
@@ -337,6 +347,11 @@ class StdlibExtractor:
         return result
 
     def _extract_go_stdlib_path(self, full_qualified_name: str) -> str:
+        if cached := _get_cached_stdlib_result(
+            cs.SupportedLanguage.GO, full_qualified_name
+        ):
+            return cached
+
         parts = full_qualified_name.split(cs.SEPARATOR_SLASH)
         if len(parts) >= 2:
             try:
@@ -351,6 +366,7 @@ class StdlibExtractor:
                     check=False,
                     capture_output=True,
                     text=True,
+                    encoding=cs.ENCODING_UTF8,
                     timeout=5,
                 )
 
@@ -444,6 +460,7 @@ func main() {
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    encoding=cs.ENCODING_UTF8,
                     env=env,
                 ) as proc:
                     stdout, _ = proc.communicate(go_script, timeout=10)
@@ -451,6 +468,11 @@ func main() {
                     if proc.returncode == 0:
                         data = json.loads(stdout.strip())
                         if data[cs.JSON_KEY_HAS_ENTITY]:
+                            _cache_stdlib_result(
+                                cs.SupportedLanguage.GO,
+                                full_qualified_name,
+                                package_path,
+                            )
                             return package_path
 
             except (
@@ -463,11 +485,23 @@ func main() {
 
             entity_name = parts[-1]
             if entity_name[:1].isupper():
-                return cs.SEPARATOR_SLASH.join(parts[:-1])
+                result = cs.SEPARATOR_SLASH.join(parts[:-1])
+                _cache_stdlib_result(
+                    cs.SupportedLanguage.GO, full_qualified_name, result
+                )
+                return result
 
+        _cache_stdlib_result(
+            cs.SupportedLanguage.GO, full_qualified_name, full_qualified_name
+        )
         return full_qualified_name
 
     def _extract_rust_stdlib_path(self, full_qualified_name: str) -> str:
+        if cached := _get_cached_stdlib_result(
+            cs.SupportedLanguage.RUST, full_qualified_name
+        ):
+            return cached
+
         parts = full_qualified_name.split(cs.SEPARATOR_DOUBLE_COLON)
         if len(parts) >= 2:
             entity_name = parts[-1]
@@ -477,66 +511,27 @@ func main() {
                 or entity_name.isupper()
                 or (cs.CHAR_UNDERSCORE not in entity_name and entity_name.islower())
             ):
-                return cs.SEPARATOR_DOUBLE_COLON.join(parts[:-1])
+                result = cs.SEPARATOR_DOUBLE_COLON.join(parts[:-1])
+                _cache_stdlib_result(
+                    cs.SupportedLanguage.RUST, full_qualified_name, result
+                )
+                return result
 
+        _cache_stdlib_result(
+            cs.SupportedLanguage.RUST, full_qualified_name, full_qualified_name
+        )
         return full_qualified_name
 
     def _extract_cpp_stdlib_path(self, full_qualified_name: str) -> str:
+        if cached := _get_cached_stdlib_result(
+            cs.SupportedLanguage.CPP, full_qualified_name
+        ):
+            return cached
+
         parts = full_qualified_name.split(cs.SEPARATOR_DOUBLE_COLON)
         if len(parts) >= 2:
             namespace = parts[0]
             if namespace == cs.CPP_STD_NAMESPACE:
-                entity_name = parts[-1]
-
-                try:
-                    import os
-                    import subprocess
-                    import tempfile
-
-                    with tempfile.NamedTemporaryFile(
-                        mode="w", suffix=".txt", delete=False
-                    ) as f:
-                        f.write(entity_name)
-                        entity_file = f.name
-
-                    try:
-                        cpp_template_program = f"""
-#include <iostream>
-#include <fstream>
-#include <string>
-
-int main() {{
-    std::ifstream file("{entity_file}");
-    std::string entity_name;
-    std::getline(file, entity_name);
-    file.close();
-
-    // This is a compile-time check strategy - we can't dynamically construct templates
-    // Fall back to heuristic approach for safety
-    std::cout << "heuristic_check" << std::endl;
-    return 0;
-}}
-                        """
-
-                        subprocess.run(
-                            ["g++", "-std=c++17", "-x", "c++", "-", "-o", "/dev/null"],
-                            check=False,
-                            input=cpp_template_program,
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                        )
-
-                    finally:
-                        os.unlink(entity_file)
-
-                except (
-                    subprocess.TimeoutExpired,
-                    subprocess.CalledProcessError,
-                    OSError,
-                ):
-                    pass
-
                 entity_name = parts[-1]
                 if (
                     entity_name[:1].isupper()
@@ -544,138 +539,84 @@ int main() {{
                     or entity_name.startswith(cs.CPP_PREFIX_HAS)
                     or entity_name in cs.CPP_STDLIB_ENTITIES
                 ):
-                    return cs.SEPARATOR_DOUBLE_COLON.join(parts[:-1])
+                    result = cs.SEPARATOR_DOUBLE_COLON.join(parts[:-1])
+                    _cache_stdlib_result(
+                        cs.SupportedLanguage.CPP, full_qualified_name, result
+                    )
+                    return result
 
+        _cache_stdlib_result(
+            cs.SupportedLanguage.CPP, full_qualified_name, full_qualified_name
+        )
         return full_qualified_name
 
     def _extract_java_stdlib_path(self, full_qualified_name: str) -> str:
+        cached_result = _get_cached_stdlib_result(
+            cs.SupportedLanguage.JAVA, full_qualified_name
+        )
+        if cached_result is not None:
+            return cached_result
+
         parts = full_qualified_name.split(cs.SEPARATOR_DOT)
         if len(parts) >= 2:
-            try:
-                import os
-                import subprocess
-                import tempfile
-
-                package_name = cs.SEPARATOR_DOT.join(parts[:-1])
-                entity_name = parts[-1]
-
-                java_program = """
-import java.lang.reflect.*;
-
-public class StdlibCheck {
-    public static void main(String[] args) {
-        if (args.length < 2) {
-            System.out.println("{\\"hasEntity\\": false}");
-            return;
-        }
-
-        String packageName = args[0];
-        String entityName = args[1];
-
-        try {
-            Class<?> clazz = Class.forName(packageName + "." + entityName);
-            System.out.println("{\\"hasEntity\\": true, \\"entityType\\": \\"class\\"}");
-        } catch (ClassNotFoundException e) {
-            // Try as method or field in parent package
-            try {
-                Class<?> packageClass = Class.forName(packageName);
-                Method[] methods = packageClass.getMethods();
-                Field[] fields = packageClass.getFields();
-
-                boolean foundMethod = false;
-                for (Method method : methods) {
-                    if (method.getName().equals(entityName)) {
-                        foundMethod = true;
-                        break;
-                    }
-                }
-
-                boolean foundField = false;
-                for (Field field : fields) {
-                    if (field.getName().equals(entityName)) {
-                        foundField = true;
-                        break;
-                    }
-                }
-
-                if (foundMethod || foundField) {
-                    System.out.println("{\\"hasEntity\\": true, \\"entityType\\": \\"member\\"}");
-                } else {
-                    System.out.println("{\\"hasEntity\\": false}");
-                }
-            } catch (Exception ex) {
-                System.out.println("{\\"hasEntity\\": false}");
-            }
-        }
-    }
-}
-                """
-
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".java", delete=False
-                ) as f:
-                    f.write(java_program)
-                    java_file = f.name
-
-                try:
-                    compile_result = subprocess.run(
-                        ["javac", java_file],
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
-
-                    if compile_result.returncode == 0:
-                        class_name = os.path.splitext(os.path.basename(java_file))[0]
-                        run_result = subprocess.run(
-                            [
-                                "java",
-                                "-cp",
-                                os.path.dirname(java_file),
-                                class_name,
-                                package_name,
-                                entity_name,
-                            ],
-                            check=False,
-                            capture_output=True,
-                            text=True,
-                            timeout=10,
-                        )
-
-                        if run_result.returncode == 0:
-                            data = json.loads(run_result.stdout.strip())
-                            if data.get(cs.JSON_KEY_HAS_ENTITY):
-                                return cs.SEPARATOR_DOT.join(parts[:-1])
-
-                finally:
-                    for ext in (cs.EXT_JAVA, cs.EXT_CLASS):
-                        temp_file = os.path.splitext(java_file)[0] + ext
-                        try:
-                            os.unlink(temp_file)
-                        except OSError:
-                            pass
-
-            except (
-                subprocess.TimeoutExpired,
-                subprocess.CalledProcessError,
-                json.JSONDecodeError,
-                OSError,
-            ):
-                pass
-
             entity_name = parts[-1]
-            if (
+            is_class_entity = (
                 entity_name[:1].isupper()
                 or entity_name.endswith(cs.JAVA_SUFFIX_EXCEPTION)
                 or entity_name.endswith(cs.JAVA_SUFFIX_ERROR)
                 or entity_name.endswith(cs.JAVA_SUFFIX_INTERFACE)
                 or entity_name.endswith(cs.JAVA_SUFFIX_BUILDER)
                 or entity_name in cs.JAVA_STDLIB_CLASSES
-            ):
-                return cs.SEPARATOR_DOT.join(parts[:-1])
+            )
 
+            if full_qualified_name.startswith(cs.JAVA_STDLIB_PREFIXES):
+                result = (
+                    cs.SEPARATOR_DOT.join(parts[:-1])
+                    if is_class_entity
+                    else full_qualified_name
+                )
+                _cache_stdlib_result(
+                    cs.SupportedLanguage.JAVA, full_qualified_name, result
+                )
+                return result
+
+            if is_class_entity:
+                result = cs.SEPARATOR_DOT.join(parts[:-1])
+                _cache_stdlib_result(
+                    cs.SupportedLanguage.JAVA, full_qualified_name, result
+                )
+                return result
+
+        _cache_stdlib_result(
+            cs.SupportedLanguage.JAVA, full_qualified_name, full_qualified_name
+        )
         return full_qualified_name
+
+    def _extract_csharp_stdlib_path(self, full_qualified_name: str) -> str:
+        cached_result = _get_cached_stdlib_result(
+            cs.SupportedLanguage.CSHARP, full_qualified_name
+        )
+        if cached_result is not None:
+            return cached_result
+
+        parts = full_qualified_name.split(cs.SEPARATOR_DOT)
+        result = full_qualified_name
+        # Fold ONLY a KNOWN stdlib type into its namespace path
+        # (`System.Collections.Generic.List` -> `System.Collections.Generic`).
+        # C# namespaces are PascalCase like types, so a case heuristic cannot tell
+        # them apart and would misfold a namespace leaf (`Microsoft.Extensions.Logging`,
+        # `System.Text.Json`); folding only a recognized type never does. Gated to a
+        # stdlib prefix so a first-party type sharing a BCL name is untouched. Exact
+        # disambiguation needs a symbol table (Roslyn).
+        if (
+            len(parts) >= 2
+            and parts[-1] in cs.CSHARP_STDLIB_CLASSES
+            and full_qualified_name.startswith(cs.CSHARP_STDLIB_PREFIXES)
+        ):
+            result = cs.SEPARATOR_DOT.join(parts[:-1])
+
+        _cache_stdlib_result(cs.SupportedLanguage.CSHARP, full_qualified_name, result)
+        return result
 
     def _extract_lua_stdlib_path(self, full_qualified_name: str) -> str:
         parts = full_qualified_name.split(cs.SEPARATOR_DOT)
@@ -731,6 +672,7 @@ end
                     check=False,
                     capture_output=True,
                     text=True,
+                    encoding=cs.ENCODING_UTF8,
                     timeout=5,
                     env=env,
                 )

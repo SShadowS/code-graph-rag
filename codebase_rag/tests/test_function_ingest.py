@@ -316,8 +316,8 @@ class TestDetermineFunctionParent:
         assert func_node is not None
 
         lang_config = queries[cs.SupportedLanguage.PYTHON]["config"]
-        parent_type, parent_qn = definition_processor._determine_function_parent(
-            func_node, "proj.module", lang_config
+        parent_type, parent_qn, _ = definition_processor._determine_function_parent(
+            func_node, "proj.module.my_function", "proj.module", lang_config
         )
         assert parent_type == "Module"
         assert parent_qn == "proj.module"
@@ -341,8 +341,8 @@ def outer():
         assert inner_func is not None
 
         lang_config = queries[cs.SupportedLanguage.PYTHON]["config"]
-        parent_type, parent_qn = definition_processor._determine_function_parent(
-            inner_func, "proj.module", lang_config
+        parent_type, parent_qn, _ = definition_processor._determine_function_parent(
+            inner_func, "proj.module.outer.inner", "proj.module", lang_config
         )
         assert parent_type == "Function"
         assert parent_qn == "proj.module.outer"
@@ -466,8 +466,9 @@ class TestBuildFunctionProps:
             is_exported=False,
         )
 
+        lang_queries = parsers_and_queries[1][cs.SupportedLanguage.PYTHON]
         result = definition_processor._build_function_props(
-            func_node, resolution, "proj.module"
+            func_node, resolution, "proj.module", lang_queries
         )
 
         assert result["qualified_name"] == "proj.module.my_function"
@@ -499,8 +500,9 @@ class TestBuildFunctionProps:
             is_exported=True,
         )
 
+        lang_queries = parsers_and_queries[1][cs.SupportedLanguage.PYTHON]
         result = definition_processor._build_function_props(
-            func_node, resolution, "proj.module"
+            func_node, resolution, "proj.module", lang_queries
         )
 
         assert result["is_exported"] is True

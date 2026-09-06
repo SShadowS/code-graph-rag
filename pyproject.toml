@@ -1,6 +1,6 @@
 [project]
 name = "code-graph-rag"
-version = "0.0.156"
+version = "0.0.878"
 description = "The ultimate RAG for your monorepo. Query, understand, and edit multi-language codebases with the power of AI and knowledge graphs"
 readme = "PYPI_README.md"
 requires-python = ">=3.12"
@@ -16,6 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 keywords = [
     "rag",
@@ -35,45 +36,79 @@ keywords = [
 ]
 dependencies = [
     "loguru>=0.7.3",
-    "mcp>=1.21.1",
-    "pydantic-ai>=1.70.0",
-    "pydantic-settings>=2.0.0",
-    "pymgclient>=1.4.0",
-    "python-dotenv>=1.1.0",
+    "mcp>=1.28.1",
+    "pydantic-ai>=2.0.0",
+    "pydantic-settings>=2.12.0",
+    "pymgclient>=1.5.1",
+    "python-dotenv>=1.2.1",
     "tiktoken>=0.12.0",
     "toml>=0.10.2",
-    "tree-sitter-al>=3.0.1",
-    "tree-sitter-python>=0.23.6",
+    "tree-sitter-al>=3.0.1,<4",
+    "tree-sitter-python>=0.25.0",
     "tree-sitter==0.25.2",
     "watchdog>=6.0.0",
-    "typer>=0.12.5",
-    "rich>=13.7.1",
-    "prompt-toolkit>=3.0.0",
+    "typer>=0.21.1",
+    "rich>=14.2.0",
+    "prompt-toolkit>=3.0.52",
     "diff-match-patch>=20241021",
-    "click>=8.0.0",
-    "protobuf>=5.27.0",
+    "click>=8.3.3",
+    "protobuf>=6.33.5",
     "defusedxml>=0.7.1",
-    "huggingface-hub[hf-xet]>=0.36.0",
+    "huggingface-hub[hf-xet]>=1.7.2",
+    "pathspec>=1.0.4",
+    "pygments>=2.20.0",
 ]
 
 [project.scripts]
 code-graph-rag = "codebase_rag.cli:app"
 cgr = "codebase_rag.cli:app"
 
+[project.entry-points.pytest11]
+cgr_trace = "codebase_rag.trace.pytest_plugin"
+
 [tool.uv]
 package = true
+
+# Patched grammars: upstream tree-sitter-c drops declarations after a
+# #define whose value embeds a block comment (issue #555). Our forks carry
+# the repeat(preproc_arg) fix; drop these overrides once upstream releases it.
+[tool.uv.sources]
+tree-sitter-c = { git = "https://github.com/vitali87/tree-sitter-c", rev = "fa327ad98f847f8173fc46926be4165c7971f960" }
+tree-sitter-cpp = { git = "https://github.com/vitali87/tree-sitter-cpp", rev = "b4a7be2f62f36dd460a14b2d1728d42d81d2c486" }
 
 [tool.setuptools.packages.find]
 include = ["codebase_rag*", "codec*", "cgr*"]
 exclude = ["*.tests", "*.tests.*"]
 
+[tool.setuptools.package-data]
+codebase_rag = [
+    "docker-compose.yaml",
+    "parsers/csharp_frontend/roslyn/*.cs",
+    "parsers/csharp_frontend/roslyn/*.csproj",
+    "parsers/go_frontend/gotypes/*.go",
+    "parsers/go_frontend/gotypes/go.mod",
+    "parsers/go_frontend/gotypes/go.sum",
+    "parsers/java_frontend/javac/cgr/*.java",
+    "parsers/ast_grep_patterns/*.yaml",
+    "analyzers/ast_grep_rules/*/*.yaml",
+]
+
 [project.optional-dependencies]
 test = [
+    "jedi>=0.19",
     "pytest>=8.4.1",
     "pytest-asyncio>=1.0.0",
     "pytest-cov>=4.0.0",
     "pytest-xdist>=3.8.0",
     "testcontainers>=4.9.0",
+    "libclang>=18.1.1",
+    "filelock>=3.12",
+    "ast-grep-py>=0.44.0",
+    "pyyaml>=6.0",
+]
+
+cpp = [
+    "libclang>=18.1.1",
 ]
 
 treesitter-full = [
@@ -87,12 +122,29 @@ treesitter-full = [
     "tree-sitter-c>=0.24.1",
     "tree-sitter-cpp>=0.23.0",
     "tree-sitter-lua>=0.0.19",
+    "tree-sitter-php>=0.24.1",
+    "tree-sitter-c-sharp>=0.23.5",
+    "tree-sitter-dart>=0.1.0",
+    "tree-sitter-sql>=0.3.11",
+    "tree-sitter-markdown>=0.5.1",
 ]
 
 semantic = [
     "qdrant-client>=1.9.0",
     "torch>=2.6.0",
     "transformers>=4.0.0",
+]
+
+milvus = [
+    "pymilvus[milvus-lite]>=3.0.0",
+]
+
+ast-grep = [
+    "ast-grep-py>=0.44.0",
+    "pyyaml>=6.0",
+]
+python-semantics = [
+    "jedi>=0.19",
 ]
 
 [tool.ruff]
@@ -107,6 +159,7 @@ ignore = [
     "PLR2004",  # magic value comparison (too noisy)
     "PLC0415",  # import not at top-level (intentional lazy imports)
     "PLR0913",  # too many arguments (often unavoidable)
+    "PLR0917",  # too many positional arguments (often unavoidable)
     "PLR0911",  # too many return statements
     "PLR0912",  # too many branches
     "PLR0915",  # too many statements
@@ -117,6 +170,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "**/tests/**" = ["T201"]
 "benchmarks/**" = ["T201"]
+"evals/flows_corpus/**" = ["T201"]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -127,8 +181,39 @@ python-version = "3.12"
 [tool.ty.src]
 exclude = ["codebase_rag/tests/test_cypher_queries.py", "codebase_rag/tests/test_code_retrieval.py", "codebase_rag/tests/test_call_resolver.py", "benchmarks/", "optimize/"]
 
+[tool.coverage.run]
+# `codebase_rag/constants/` is excluded because coverage cannot say anything
+# useful about it, not because it is untested (issue #1599).
+#
+# Those 31 modules are almost entirely module-level assignments. A constant
+# definition executes exactly once, at import, and cannot fail to execute if
+# the module is imported at all -- so the measurement is 100% or 0% depending
+# on whether tracing had started by then, never on whether anything is tested.
+# Measured under pytest it is 0/2858 lines, because conftest imports
+# `graph_updater` (which alone pulls all 31) during collection, before
+# pytest-cov begins tracing. Importing the same package after starting
+# coverage manually records the lines normally.
+#
+# Keeping it in the denominator understated source coverage by ~2856 lines and
+# made `constants/` read as the largest gap in the tree while carrying no
+# signal in either direction. Excluding it makes the remaining figure mean
+# something; it does not hide dead code, since an unused constant executes at
+# import exactly like a used one and coverage could never have flagged it.
+#
+# This is not a new judgement: `sonar-project.properties` already carries
+# `sonar.coverage.exclusions=...,codebase_rag/constants/**`. The two tools
+# disagreed, and this makes Codecov match the call the project had made.
+omit = ["codebase_rag/constants/*"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# loadgroup honors the xdist_group marker that pins the integration dir to
+# one worker; for unmarked tests it schedules identically to the default.
+# xdist workers decide their grouping flag from the parsed args/ini before
+# any conftest hook fires (xdist remote.py setup_config), so this must be
+# an ini-level option; every dependency set that carries pytest also
+# carries pytest-xdist, so the flag always parses.
+addopts = "--dist=loadgroup"
 testpaths = ["codebase_rag/tests"]
 norecursedirs = ["grammars", ".git", "__pycache__", "*.egg-info", ".venv", "venv"]
 python_files = ["test_*.py", "*_test.py"]
@@ -148,6 +233,7 @@ dev = [
     "pyinstaller>=6.14.1",
     "pylint>=4.0.4",
     "pytest>=9.0.2",
+    "pytest-xdist>=3.8.0",
     "radon>=6.0.1",
     "ruff>=0.5.5",
     "semgrep>=1.79.0",

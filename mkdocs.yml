@@ -85,9 +85,15 @@ nav:
     - CLI Reference: guide/cli-reference.md
     - Interactive Querying: guide/interactive-querying.md
     - Code Optimization: guide/code-optimization.md
+    - Dead Code Detection: guide/dead-code.md
+    - Duplicate Code Detection: guide/duplicates.md
+    - C/C++ Semantic Mode: guide/cpp-semantic-mode.md
+    - Dynamic Call Tracing: guide/dynamic-tracing.md
     - Graph Export: guide/graph-export.md
     - Real-Time Updates: guide/realtime-updates.md
+    - C/C++ Semantic Mode: guide/cpp-semantic-mode.md
     - MCP Server: guide/mcp-server.md
+    - Multi-Project Graphs: guide/multi-project.md
   - Python SDK:
     - Overview: sdk/overview.md
     - Graph Loader: sdk/graph-loader.md
@@ -96,13 +102,24 @@ nav:
   - Architecture:
     - Overview: architecture/overview.md
     - Graph Schema: architecture/graph-schema.md
+    - I/O and Data-Flow Edges: architecture/data-flow-edges.md
     - Language Support: architecture/language-support.md
+    - Adding a Language Frontend: architecture/language-frontends.md
+    - Security Model: architecture/security.md
+    - Span-Preserving Patchers: architecture/patchers.md
+    - Edit Transactions: architecture/edit-transactions.md
   - Advanced:
     - Adding Languages: advanced/adding-languages.md
     - Ignore Patterns: advanced/ignore-patterns.md
+    - Git Submodules: advanced/git-submodules.md
     - Building Binaries: advanced/building-binaries.md
     - Troubleshooting: advanced/troubleshooting.md
+  - Roadmap: roadmap.md
   - Contributing: contributing.md
+
+# Internal analysis artifacts kept in the repo but not published to the doc site nav.
+not_in_nav: |
+  /reports/
 
 extra_css:
   - stylesheets/extra.css

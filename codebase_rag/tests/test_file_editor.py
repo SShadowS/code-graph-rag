@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 from pydantic_ai import Tool
 
+from codebase_rag import constants as cs
+from codebase_rag.parser_loader import load_parsers
 from codebase_rag.tools.file_editor import (
     EditResult,
     FileEditor,
     create_file_editor_tool,
 )
+
+
+def _skip_unless_javascript_grammar() -> None:
+    parsers, _queries = load_parsers()
+    if cs.SupportedLanguage.JS not in parsers:
+        pytest.skip("javascript parser not available")
+
 
 pytestmark = [pytest.mark.anyio]
 
@@ -70,8 +80,11 @@ class TestFileEditorInit:
         assert file_editor.dmp is not None
 
     def test_init_loads_parsers(self, file_editor: FileEditor) -> None:
+        # parsers is a lazy Mapping view since #68; membership loads the
+        # grammar on demand
         assert file_editor.parsers is not None
-        assert isinstance(file_editor.parsers, dict)
+        assert isinstance(file_editor.parsers, Mapping)
+        assert cs.SupportedLanguage.PYTHON in file_editor.parsers
 
 
 class TestEditResult:
@@ -100,6 +113,7 @@ class TestGetParser:
     def test_get_parser_for_javascript(
         self, file_editor: FileEditor, sample_js_file: Path
     ) -> None:
+        _skip_unless_javascript_grammar()
         parser = file_editor.get_parser("sample.js")
         assert parser is not None
 
@@ -119,6 +133,7 @@ class TestGetAst:
     def test_get_ast_for_javascript_file(
         self, file_editor: FileEditor, sample_js_file: Path
     ) -> None:
+        _skip_unless_javascript_grammar()
         root_node = file_editor.get_ast(str(sample_js_file))
         assert root_node is not None
         assert root_node.type == "program"

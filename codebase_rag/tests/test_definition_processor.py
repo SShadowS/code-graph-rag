@@ -1,4 +1,3 @@
-from importlib.util import find_spec
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -872,7 +871,7 @@ class TestProcessFile:
         rel = contains_module[-1]
         from_tuple = rel[0][0]
         assert from_tuple[0] == "Folder"
-        assert from_tuple[2] == "scripts"
+        assert from_tuple[2] == (temp_repo / "scripts").resolve().as_posix()
 
     def test_process_file_registers_module_qn_to_file_path(
         self, temp_repo: Path, definition_processor: GraphUpdater
@@ -971,7 +970,13 @@ def standalone():
         assert len(module_nodes) >= 1
 
 
-RUST_AVAILABLE = find_spec("tree_sitter_rust") is not None
+# Ask the production loader, not `find_spec`. A grammar wheel whose ABI does
+# not match the installed `tree_sitter` imports fine and then raises from
+# `Language(lang_lib())` (`parser_loader.py:379`), which `_process_language`
+# catches -- so the language never lands in the store while `find_spec` still
+# reports it present. Guarding on importability leaves these tests running
+# against a parser that does not exist, failing instead of skipping (#1591).
+RUST_AVAILABLE = "rust" in load_parsers()[0]
 
 
 @pytest.mark.skipif(not RUST_AVAILABLE, reason="tree-sitter-rust not available")

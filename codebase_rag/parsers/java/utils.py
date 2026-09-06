@@ -38,10 +38,10 @@ def get_root_node_from_module_qn(
         return None
 
     file_path = module_qn_to_file_path.get(module_qn)
-    if file_path is None or file_path not in ast_cache:
+    if file_path is None or not (entry := ast_cache.load(file_path)):
         return None
 
-    root_node, _ = ast_cache[file_path]
+    root_node, _ = entry
     return root_node
 
 
@@ -90,8 +90,6 @@ def extract_import_path(import_node: ASTNode) -> dict[str, str]:
 
     for child in import_node.children:
         match child.type:
-            case cs.TS_STATIC:
-                pass
             case cs.TS_SCOPED_IDENTIFIER | cs.TS_IDENTIFIER:
                 imported_path = safe_decode_text(child)
             case cs.TS_ASTERISK:
@@ -114,15 +112,36 @@ def _extract_superclass(class_node: ASTNode) -> str | None:
     superclass_node = class_node.child_by_field_name(cs.TS_FIELD_SUPERCLASS)
     if not superclass_node:
         return None
+    return _extract_type_identifier_name(superclass_node)
 
-    match superclass_node.type:
+
+def _extract_type_identifier_name(node: ASTNode) -> str | None:
+    match node.type:
         case cs.TS_TYPE_IDENTIFIER:
-            return safe_decode_text(superclass_node)
+            return safe_decode_text(node)
+        case cs.TS_SCOPED_TYPE_IDENTIFIER:
+            # `Outer.Base`/`pkg.Base`: keep the full scoped name rather than descend
+            # to the first segment (the outer/package), which would point resolution
+            # at the wrong class.
+            return safe_decode_text(node)
         case cs.TS_GENERIC_TYPE:
-            for child in superclass_node.children:
-                if child.type == cs.TS_TYPE_IDENTIFIER:
+            # The base of a generic type is its first type_identifier/scoped child
+            # (`Box<T>` -> Box, `Outer.Base<T>` -> Outer.Base); ignore the
+            # type_arguments that follow.
+            for child in node.children:
+                if child.type in (
+                    cs.TS_TYPE_IDENTIFIER,
+                    cs.TS_SCOPED_TYPE_IDENTIFIER,
+                ):
                     return safe_decode_text(child)
-    return None
+            return None
+        case _:
+            # `extends X` exposes a `superclass` wrapper node, not the type itself;
+            # descend to reach the type_identifier/generic_type.
+            for child in node.children:
+                if name := _extract_type_identifier_name(child):
+                    return name
+            return None
 
 
 def _extract_interface_name(type_child: ASTNode) -> str | None:
@@ -314,6 +333,50 @@ def extract_field_info(field_node: ASTNode) -> JavaFieldInfo:
     )
 
 
+def _java_cast_target_type(object_node: ASTNode) -> str | None:
+    # The target type of a cast receiver: unwrap a parenthesised wrapper to the
+    # cast_expression, read its `type` field, strip generic args so
+    # `((a.b.Reader<T>) x)` -> `a.b.Reader`. The package is KEPT so a qualified cast
+    # resolves to the right class (the resolver handles dotted/alternate-module
+    # names); stripping it would collapse it onto a same-package/imported same-leaf
+    # type. None when there is no cast type.
+    cast = object_node
+    while cast.type == cs.TS_PARENTHESIZED_EXPRESSION:
+        cast = next(
+            (c for c in cast.children if c.type not in cs.DELIMITER_TOKENS), None
+        )
+        if cast is None:
+            return None
+    if cast.type != cs.TS_JAVA_CAST_EXPRESSION:
+        return None
+    type_node = cast.child_by_field_name(cs.FIELD_TYPE)
+    if type_node is None:
+        return None
+    type_text = safe_decode_text(type_node)
+    if not type_text:
+        return None
+    base = type_text.split(cs.CHAR_ANGLE_OPEN, 1)[0]
+    return base.strip() or None
+
+
+def _java_paren_receiver(object_node: ASTNode) -> str | None:
+    # A parenthesised NON-cast receiver `(reader).m()` (or nested `((reader))`):
+    # unwrap the parentheses and return the inner identifier/field-access text so the
+    # call resolves through that variable's type, instead of falling to the
+    # unqualified resolver and binding a same-named decoy. None when the inner
+    # expression is neither an identifier nor a field access.
+    node = object_node
+    while node.type == cs.TS_PARENTHESIZED_EXPRESSION:
+        node = next(
+            (c for c in node.children if c.type not in cs.DELIMITER_TOKENS), None
+        )
+        if node is None:
+            return None
+    if node.type in (cs.TS_IDENTIFIER, cs.TS_FIELD_ACCESS):
+        return safe_decode_text(node)
+    return None
+
+
 def extract_method_call_info(call_node: ASTNode) -> JavaMethodCallInfo | None:
     if call_node.type != cs.TS_METHOD_INVOCATION:
         return None
@@ -331,6 +394,15 @@ def extract_method_call_info(call_node: ASTNode) -> JavaMethodCallInfo | None:
                 obj = cs.TS_SUPER
             case cs.TS_IDENTIFIER | cs.TS_FIELD_ACCESS:
                 obj = safe_decode_text(object_node)
+            case cs.TS_PARENTHESIZED_EXPRESSION | cs.TS_JAVA_CAST_EXPRESSION:
+                # A cast receiver `((T) x).m()`: the cast's target type is the
+                # receiver type, so m resolves on T. A parenthesised non-cast receiver
+                # `(reader).m()` keeps its inner identifier/field-access receiver.
+                # Without this the call falls to the unqualified path and never finds
+                # a cross-file/sibling T or the variable's type.
+                obj = _java_cast_target_type(object_node) or _java_paren_receiver(
+                    object_node
+                )
 
     arguments = 0
     if args_node := call_node.child_by_field_name(cs.TS_FIELD_ARGUMENTS):

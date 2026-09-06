@@ -7,8 +7,23 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from codebase_rag import constants as cs
 from codebase_rag.embedder import EmbeddingCache, clear_embedding_cache
-from codebase_rag.utils.dependencies import has_torch, has_transformers
+from codebase_rag.utils.dependencies import (
+    has_local_embedding_weights,
+    has_torch,
+    has_transformers,
+)
+
+# These embed for real. Gating on the weights being on disk keeps the unit
+# suite off the network: a HuggingFace outage or 429 used to fail PRs for
+# reasons unrelated to the change under test (issue #1092). CI populates the
+# hub cache in an explicit step, so there the tests still run and still fail
+# hard.
+needs_local_weights = pytest.mark.skipif(
+    not has_local_embedding_weights(),
+    reason=f"{cs.UNIXCODER_MODEL} weights are not in the local HuggingFace cache",
+)
 
 
 def _has_semantic_deps() -> bool:
@@ -132,13 +147,13 @@ def test_get_model_uses_cuda_when_available(reset_model_cache: None) -> None:
     with patch("codebase_rag.embedder.UniXcoder") as mock_unixcoder_class:
         mock_instance = MagicMock()
         mock_instance.eval.return_value = mock_instance
-        mock_instance.cuda.return_value = mock_instance
+        mock_instance.to.return_value = mock_instance
         mock_unixcoder_class.return_value = mock_instance
 
         with patch("codebase_rag.embedder.torch.cuda.is_available", return_value=True):
             get_model()
 
-    mock_instance.cuda.assert_called_once()
+    mock_instance.to.assert_called_once_with(cs.EmbeddingDevice.CUDA)
 
 
 @pytest.mark.skipif(not _has_semantic_deps(), reason="torch/transformers not installed")
@@ -157,6 +172,65 @@ def test_get_model_does_not_use_cuda_when_unavailable(reset_model_cache: None) -
 
 
 @pytest.mark.skipif(not _has_semantic_deps(), reason="torch/transformers not installed")
+def test_select_device_prefers_cuda() -> None:
+    from codebase_rag.embedder import (
+        _select_device,  # ty: ignore[possibly-missing-import]
+    )
+
+    with patch("codebase_rag.embedder.torch.cuda.is_available", return_value=True):
+        with patch(
+            "codebase_rag.embedder.torch.backends.mps.is_available", return_value=True
+        ):
+            assert _select_device() == "cuda"
+
+
+@pytest.mark.skipif(not _has_semantic_deps(), reason="torch/transformers not installed")
+def test_select_device_uses_mps_when_cuda_unavailable() -> None:
+    from codebase_rag.embedder import (
+        _select_device,  # ty: ignore[possibly-missing-import]
+    )
+
+    with patch("codebase_rag.embedder.torch.cuda.is_available", return_value=False):
+        with patch(
+            "codebase_rag.embedder.torch.backends.mps.is_available", return_value=True
+        ):
+            assert _select_device() == "mps"
+
+
+@pytest.mark.skipif(not _has_semantic_deps(), reason="torch/transformers not installed")
+def test_select_device_falls_back_to_cpu() -> None:
+    from codebase_rag.embedder import (
+        _select_device,  # ty: ignore[possibly-missing-import]
+    )
+
+    with patch("codebase_rag.embedder.torch.cuda.is_available", return_value=False):
+        with patch(
+            "codebase_rag.embedder.torch.backends.mps.is_available", return_value=False
+        ):
+            assert _select_device() == "cpu"
+
+
+@pytest.mark.skipif(not _has_semantic_deps(), reason="torch/transformers not installed")
+def test_get_model_moves_to_mps_when_available(reset_model_cache: None) -> None:
+    from codebase_rag.embedder import get_model  # ty: ignore[possibly-missing-import]
+
+    with patch("codebase_rag.embedder.UniXcoder") as mock_unixcoder_class:
+        mock_instance = MagicMock()
+        mock_instance.eval.return_value = mock_instance
+        mock_instance.to.return_value = mock_instance
+        mock_unixcoder_class.return_value = mock_instance
+
+        with patch("codebase_rag.embedder.torch.cuda.is_available", return_value=False):
+            with patch(
+                "codebase_rag.embedder.torch.backends.mps.is_available",
+                return_value=True,
+            ):
+                get_model()
+
+    mock_instance.to.assert_called_once_with("mps")
+
+
+@needs_local_weights
 @pytest.mark.slow
 def test_embed_code_integration(reset_model_cache: None) -> None:
     from codebase_rag.embedder import embed_code
@@ -169,7 +243,7 @@ def test_embed_code_integration(reset_model_cache: None) -> None:
     assert all(isinstance(x, float) for x in result)
 
 
-@pytest.mark.skipif(not _has_semantic_deps(), reason="torch/transformers not installed")
+@needs_local_weights
 @pytest.mark.slow
 def test_similar_code_has_similar_embeddings(reset_model_cache: None) -> None:
     from codebase_rag.embedder import embed_code
@@ -487,6 +561,12 @@ def test_embed_code_batch_raises_without_dependencies() -> None:
 
     with pytest.raises(RuntimeError, match="Semantic search requires"):
         embed_code_batch(["x = 1"])
+
+
+def test_embedding_default_batch_size_at_least_64() -> None:
+    from codebase_rag import constants as cs
+
+    assert cs.EMBEDDING_DEFAULT_BATCH_SIZE >= 64
 
 
 def test_embedding_cache_persistence_roundtrip() -> None:

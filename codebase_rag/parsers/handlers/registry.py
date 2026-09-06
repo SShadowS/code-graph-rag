@@ -9,6 +9,7 @@ from .cpp import CppHandler
 from .java import JavaHandler
 from .js_ts import JsTsHandler
 from .lua import LuaHandler
+from .php import PhpHandler
 from .protocol import LanguageHandler
 from .python import PythonHandler
 from .rust import RustHandler
@@ -17,10 +18,12 @@ _HANDLERS: dict[SupportedLanguage, type[BaseLanguageHandler]] = {
     SupportedLanguage.PYTHON: PythonHandler,
     SupportedLanguage.JS: JsTsHandler,
     SupportedLanguage.TS: JsTsHandler,
+    SupportedLanguage.TSX: JsTsHandler,
     SupportedLanguage.CPP: CppHandler,
     SupportedLanguage.RUST: RustHandler,
     SupportedLanguage.JAVA: JavaHandler,
     SupportedLanguage.LUA: LuaHandler,
+    SupportedLanguage.PHP: PhpHandler,
     SupportedLanguage.AL: AlHandler,
 }
 

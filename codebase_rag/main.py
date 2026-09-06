@@ -1,53 +1,87 @@
+"""Interactive agent loop: turn natural-language questions into graph queries."""
+
 from __future__ import annotations
 
 import asyncio
 import difflib
 import json
+import mimetypes
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import uuid
 from collections import deque
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
+from contextlib import contextmanager
 from dataclasses import replace
+from decimal import Decimal
+from functools import lru_cache
+from html import escape as html_escape
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loguru import logger
-from prompt_toolkit import prompt
+from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import History, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.shortcuts import print_formatted_text
-from pydantic_ai import DeferredToolRequests, DeferredToolResults, ToolDenied
-from rich.markdown import Markdown
+from pydantic_ai import (
+    BinaryContent,
+    DeferredToolRequests,
+    DeferredToolResults,
+    ToolDenied,
+)
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    ToolCallPart,
+    ToolReturnPart,
+    UserContent,
+)
+from rich.console import Group
+from rich.live import Live
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
+from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
 from . import constants as cs
 from . import exceptions as ex
 from . import logs as ls
-from .config import ModelConfig, load_cgrignore_patterns, settings
+from .config import ModelConfig, load_ignore_patterns, settings
+from .context_pruning import prune_old_tool_results
 from .models import AppContext
 from .prompts import OPTIMIZATION_PROMPT, OPTIMIZATION_PROMPT_WITH_REFERENCE
 from .providers.base import get_provider_from_config
 from .services import QueryProtocol
 from .services.graph_service import MemgraphIngestor
-from .services.llm import CypherGenerator, create_rag_orchestrator
+from .services.llm import (
+    CypherGenerator,
+    create_rag_orchestrator,
+    create_research_agent,
+)
+from .taint import ReadContentRecord
+from .tools.ast_grep_service import AstGrepService
 from .tools.code_retrieval import CodeRetriever, create_code_retrieval_tool
 from .tools.codebase_query import create_query_tool
 from .tools.directory_lister import DirectoryLister, create_directory_lister_tool
-from .tools.document_analyzer import DocumentAnalyzer, create_document_analyzer_tool
+from .tools.duplicate_detection import create_find_duplicates_tool
 from .tools.file_editor import FileEditor, create_file_editor_tool
 from .tools.file_reader import FileReader, create_file_reader_tool
 from .tools.file_writer import FileWriter, create_file_writer_tool
+from .tools.research import create_research_tool
 from .tools.semantic_search import (
     create_get_function_source_tool,
     create_semantic_search_tool,
 )
 from .tools.shell_command import ShellCommander, create_shell_command_tool
+from .tools.structural_editor import create_structural_editor_tool
+from .tools.structural_search import create_structural_search_tool
+from .tools.web_search import create_web_search_tool, make_web_searcher
 from .types_defs import (
     CHAT_LOOP_UI,
     OPTIMIZATION_LOOP_UI,
@@ -57,17 +91,21 @@ from .types_defs import (
     ConfirmationToolNames,
     CreateFileArgs,
     GraphData,
+    QueryJsonOutput,
     RawToolArgs,
     ReplaceCodeArgs,
     ShellCommandArgs,
+    StructuralReplaceArgs,
     ToolArgs,
 )
+from .utils.rich_markdown import LeftAlignedMarkdown
 
 if TYPE_CHECKING:
     from prompt_toolkit.key_binding import KeyPressEvent
     from pydantic_ai import Agent
     from pydantic_ai.messages import ModelMessage
     from pydantic_ai.models import Model
+    from pydantic_ai.usage import RunUsage
 
 
 def style(
@@ -107,6 +145,50 @@ def get_session_context() -> str:
         content = app_context.session.log_file.read_text(encoding="utf-8")
         return f"{cs.SESSION_CONTEXT_START}{content}{cs.SESSION_CONTEXT_END}"
     return ""
+
+
+def _autowrap_diff_blocks(text: str) -> str:
+    if cs.DIFF_GIT_HEADER not in text:
+        return text
+    lines = text.split("\n")
+    out: list[str] = []
+    in_fence = False
+    in_diff = False
+
+    def is_diff_continuation(line: str) -> bool:
+        if line == "":
+            return True
+        return line.startswith(cs.DIFF_CONTINUATION_PREFIXES)
+
+    for line in lines:
+        if line.startswith(cs.MARKDOWN_FENCE):
+            if in_diff:
+                out.append(cs.MARKDOWN_FENCE)
+                in_diff = False
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+        if not in_diff and line.startswith(cs.DIFF_GIT_HEADER):
+            out.append(cs.MARKDOWN_FENCE_DIFF)
+            in_diff = True
+            out.append(line)
+            continue
+        if in_diff:
+            if is_diff_continuation(line):
+                out.append(line)
+            else:
+                out.append(cs.MARKDOWN_FENCE)
+                in_diff = False
+                out.append(line)
+            continue
+        out.append(line)
+
+    if in_diff:
+        out.append(cs.MARKDOWN_FENCE)
+    return "\n".join(out)
 
 
 def _print_unified_diff(target: str, replacement: str, path: str) -> None:
@@ -177,6 +259,13 @@ def _to_tool_args(
             )
         case tool_names.shell_command:
             return ShellCommandArgs(command=raw_args.command)
+        case tool_names.structural_replace:
+            return StructuralReplaceArgs(
+                pattern=raw_args.pattern,
+                rewrite=raw_args.rewrite,
+                language=raw_args.language,
+                dry_run=raw_args.dry_run,
+            )
         case _:
             return ShellCommandArgs()
 
@@ -208,6 +297,33 @@ def _display_tool_call_diff(
                 style(f"$ {command}", cs.Color.YELLOW, cs.StyleModifier.NONE)
             )
 
+        case tool_names.structural_replace:
+            pattern = str(tool_args.get(cs.ARG_PATTERN, ""))
+            rewrite = str(tool_args.get(cs.ARG_REWRITE, ""))
+            dry_run = tool_args.get(cs.ARG_DRY_RUN, True)
+            app_context.console.print(f"\n{cs.AST_GREP_APPROVAL_HEADER}")
+            app_context.console.print(
+                style(
+                    cs.AST_GREP_APPROVAL_PATTERN.format(pattern=pattern),
+                    cs.Color.YELLOW,
+                    cs.StyleModifier.NONE,
+                )
+            )
+            app_context.console.print(
+                style(
+                    cs.AST_GREP_APPROVAL_REWRITE.format(rewrite=rewrite),
+                    cs.Color.YELLOW,
+                    cs.StyleModifier.NONE,
+                )
+            )
+            app_context.console.print(
+                style(
+                    cs.AST_GREP_APPROVAL_DRY_RUN.format(dry_run=dry_run),
+                    cs.Color.YELLOW,
+                    cs.StyleModifier.NONE,
+                )
+            )
+
         case _:
             app_context.console.print(
                 cs.UI_TOOL_ARGS_FORMAT.format(
@@ -216,7 +332,7 @@ def _display_tool_call_diff(
             )
 
 
-def _process_tool_approvals(
+async def _process_tool_approvals(
     requests: DeferredToolRequests,
     approval_prompt: str,
     denial_default: str,
@@ -228,30 +344,102 @@ def _process_tool_approvals(
         tool_args = _to_tool_args(
             call.tool_name, RawToolArgs(**call.args_as_dict()), tool_names
         )
-        app_context.console.print(
-            f"\n{cs.UI_TOOL_APPROVAL.format(tool_name=call.tool_name)}"
+        will_prompt = (
+            app_context.session.confirm_edits and not app_context.session.is_yolo()
         )
+
+        if will_prompt:
+            app_context.console.print(
+                f"\n{cs.UI_TOOL_APPROVAL.format(tool_name=call.tool_name)}"
+            )
         _display_tool_call_diff(call.tool_name, tool_args, tool_names)
 
-        if app_context.session.confirm_edits:
-            if Confirm.ask(style(approval_prompt, cs.Color.CYAN)):
-                deferred_results.approvals[call.tool_call_id] = True
-            else:
-                feedback = Prompt.ask(
-                    cs.UI_FEEDBACK_PROMPT,
-                    default="",
-                )
-                denial_msg = feedback.strip() or denial_default
-                deferred_results.approvals[call.tool_call_id] = ToolDenied(denial_msg)
-        else:
+        if not will_prompt:
             deferred_results.approvals[call.tool_call_id] = True
+            continue
+
+        if await _confirm_with_toggle(approval_prompt):
+            deferred_results.approvals[call.tool_call_id] = True
+        elif app_context.session.is_yolo():
+            deferred_results.approvals[call.tool_call_id] = True
+        else:
+            feedback = await _prompt_with_toggle(cs.UI_FEEDBACK_PROMPT)
+            denial_msg = feedback.strip() or denial_default
+            deferred_results.approvals[call.tool_call_id] = ToolDenied(denial_msg)
 
     return deferred_results
 
 
+def _approval_keybindings() -> KeyBindings:
+    bindings = KeyBindings()
+
+    @bindings.add(cs.KeyBinding.SHIFT_TAB)
+    def _toggle(event: KeyPressEvent) -> None:
+        app_context.session.cycle_permission_mode()
+        if app_context.session.is_yolo():
+            event.app.exit(result=cs.YES_ANSWER)
+        else:
+            event.app.invalidate()
+
+    @bindings.add(cs.KeyBinding.CTRL_C)
+    def _interrupt(event: KeyPressEvent) -> None:
+        event.app.exit(exception=KeyboardInterrupt)
+
+    return bindings
+
+
+async def _confirm_with_toggle(question: str) -> bool:
+    bindings = _approval_keybindings()
+    prompt_text = HTML(
+        f'<style fg="ansicyan">{html_escape(question)}</style> [y/n] (Y): '
+    )
+    session: PromptSession[str] = PromptSession()
+    while True:
+        try:
+            answer = await session.prompt_async(
+                prompt_text,
+                key_bindings=bindings,
+                style=ORANGE_STYLE,
+                bottom_toolbar=_status_bar_label,
+                refresh_interval=0.5,
+            )
+        except (KeyboardInterrupt, EOFError):
+            return False
+        if app_context.session.is_yolo():
+            return True
+        normalized = (answer or "").strip().lower()
+        if normalized in cs.YES_ANSWERS:
+            return True
+        if normalized in cs.NO_ANSWERS:
+            return False
+
+
+async def _prompt_with_toggle(question: str) -> str:
+    bindings = _approval_keybindings()
+    prompt_text = HTML(
+        f'<style fg="ansiyellow"><b>{html_escape(question)}</b></style>: '
+    )
+    session: PromptSession[str] = PromptSession()
+    try:
+        answer = await session.prompt_async(
+            prompt_text,
+            key_bindings=bindings,
+            style=ORANGE_STYLE,
+            bottom_toolbar=_status_bar_label,
+            refresh_interval=0.5,
+        )
+    except (KeyboardInterrupt, EOFError):
+        return ""
+    return answer or ""
+
+
+def _rich_log_sink(message: object) -> None:
+    app_context.console.print(str(message), end="", markup=False, highlight=False)
+
+
 def _setup_common_initialization(repo_path: str) -> Path:
     logger.remove()
-    logger.add(sys.stdout, format=cs.LOG_FORMAT)
+    logger.add(_rich_log_sink, format=cs.LOG_FORMAT, colorize=False)
 
     project_root = Path(repo_path).resolve()
     tmp_dir = project_root / cs.TMP_DIR
@@ -262,6 +450,7 @@ def _setup_common_initialization(repo_path: str) -> Path:
             tmp_dir.unlink()
     tmp_dir.mkdir()
 
+    app_context.session.target_repo = project_root
     return project_root
 
 
@@ -364,67 +553,186 @@ async def run_with_cancellation[T](
         return await asyncio.wait_for(task, timeout=timeout) if timeout else await task
     except TimeoutError:
         task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        await asyncio.gather(task, return_exceptions=True)
         app_context.console.print(
             f"\n{style(cs.MSG_TIMEOUT_FORMAT.format(timeout=timeout), cs.Color.YELLOW)}"
         )
         return CancelledResult(cancelled=True)
     except (asyncio.CancelledError, KeyboardInterrupt):
-        if not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         app_context.console.print(
             f"\n{style(cs.MSG_THINKING_CANCELLED, cs.Color.YELLOW)}"
         )
         return CancelledResult(cancelled=True)
 
 
+def _cancel_orphaned_tool_calls(message_history: list[ModelMessage]) -> None:
+    if not message_history:
+        return
+    last = message_history[-1]
+    if not isinstance(last, ModelResponse):
+        return
+    tool_calls = [p for p in last.parts if isinstance(p, ToolCallPart)]
+    if not tool_calls:
+        return
+    message_history.append(
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name=p.tool_name,
+                    content=cs.MSG_TOOL_CALL_CANCELLED,
+                    tool_call_id=p.tool_call_id,
+                )
+                for p in tool_calls
+            ]
+        )
+    )
+
+
+def _price_current_run(
+    usage: RunUsage, model_config: ModelConfig | None
+) -> Decimal | None:
+    """Price a run's usage, defaulting to the active orchestrator config.
+
+    Returns None when pricing is unavailable; pricing is display-only and
+    never fatal.
+    """
+    if model_config is None:
+        try:
+            model_config = settings.active_orchestrator_config
+        except Exception:  # noqa: BLE001 - pricing is display-only, never fatal
+            return None
+    from .services.usage_cost import price_run
+
+    return price_run(usage, model_config.provider, model_config.model_id)
+
+
+def _absorb_research_usage(usage: RunUsage) -> None:
+    """Fold research sub-agent token usage into the session totals.
+
+    Sub-agent runs happen inside a tool call, outside the turn's own
+    `response.usage` (#1128). The sub-agent reuses the orchestrator model, so
+    orchestrator pricing holds.
+    """
+    session = app_context.session
+    session.total_input_tokens += usage.input_tokens
+    session.total_output_tokens += usage.output_tokens
+    cost = _price_current_run(usage, None)
+    if cost is not None:
+        session.total_cost_usd += cost
+    else:
+        session.cost_incomplete = True
+
+
+def _record_and_print_turn_usage(
+    turn_input: int, turn_output: int, turn_cost: Decimal, turn_priced: bool
+) -> None:
+    """Fold one turn's tokens and cost into the session totals and show them."""
+    session = app_context.session
+    session.total_input_tokens += turn_input
+    session.total_output_tokens += turn_output
+    session.total_cost_usd += turn_cost
+    if not turn_priced:
+        session.cost_incomplete = True
+    line = cs.UI_TURN_USAGE_TOKENS.format(
+        ti=turn_input,
+        to=turn_output,
+        si=session.total_input_tokens,
+        so=session.total_output_tokens,
+    )
+    if turn_priced:
+        template = (
+            cs.UI_TURN_USAGE_COST_PARTIAL
+            if session.cost_incomplete
+            else cs.UI_TURN_USAGE_COST
+        )
+        line += template.format(tc=turn_cost, sc=session.total_cost_usd)
+    app_context.console.print(dim(line))
+
+
 async def _run_agent_response_loop(
     rag_agent: Agent[None, str | DeferredToolRequests],
     message_history: list[ModelMessage],
-    question_with_context: str,
+    question_with_context: str | list[UserContent],
     config: AgentLoopUI,
     tool_names: ConfirmationToolNames,
     model_override: Model | None = None,
+    model_override_config: ModelConfig | None = None,
 ) -> None:
     deferred_results: DeferredToolResults | None = None
+    pending_prompt: str | list[UserContent] | None = question_with_context
+    turn_input = turn_output = 0
+    turn_cost = Decimal(0)
+    turn_priced = False
 
     while True:
-        with app_context.console.status(config.status_message):
+        with _thinking_with_status_bar(config.status_message):
             response = await run_with_cancellation(
                 rag_agent.run(
-                    question_with_context,
+                    pending_prompt,
                     message_history=message_history,
                     deferred_tool_results=deferred_results,
                     model=model_override,
                 ),
             )
+        pending_prompt = None
 
         if isinstance(response, CancelledResult):
             log_session_event(config.cancelled_log)
             app_context.session.cancelled = True
+            _cancel_orphaned_tool_calls(message_history)
             break
 
+        message_history.extend(response.new_messages())
+
+        run_usage = response.usage
+        turn_input += run_usage.input_tokens
+        turn_output += run_usage.output_tokens
+        run_cost = _price_current_run(run_usage, model_override_config)
+        if run_cost is not None:
+            turn_cost += run_cost
+            turn_priced = True
+
         if isinstance(response.output, DeferredToolRequests):
-            deferred_results = _process_tool_approvals(
+            deferred_results = await _process_tool_approvals(
                 response.output,
                 config.approval_prompt,
                 config.denial_default,
                 tool_names,
             )
-            message_history.extend(response.new_messages())
             continue
+
+        # Bound the context BEFORE the counter snapshots it. The refresh below
+        # is handed `list(message_history)` at spawn time, so pruning after it
+        # would count the pre-prune history and write that total back: the next
+        # turn would re-trigger on a number this prune already invalidated.
+        #
+        # The threshold is `TOKEN_THRESHOLD_CRITICAL`, the level this project
+        # already calls critical for this exact quantity (it drives the status
+        # line). Inheriting it means the shipped default is a decision the
+        # repository made rather than one chosen to satisfy a review.
+        #
+        # DELIBERATELY TIMID, and issue #1500 owns the policy. Two ways this
+        # declines to act: `_token_usage` reports 0 for every provider whose
+        # counter never runs (`_refresh_context_tokens` returns early unless
+        # Anthropic with a key), and `prune_old_tool_results` refuses below its
+        # own recovery floor. A mechanism that discards data should be inert
+        # where it cannot measure, so both silences are the wanted direction.
+        _, _, context_pct = _token_usage()
+        if context_pct >= cs.TOKEN_THRESHOLD_CRITICAL:
+            # Assign THROUGH the slice: callers hold this same list and the
+            # loop mutates it in place, so rebinding would prune a copy and
+            # leave the conversation untouched -- a call site that satisfies a
+            # reachability check while doing nothing.
+            message_history[:] = prune_old_tool_results(message_history)
+
+        _spawn_background(_refresh_context_tokens(list(message_history)))
 
         output_text = response.output
         if not isinstance(output_text, str):
             continue
-        markdown_response = Markdown(output_text)
+        markdown_response = LeftAlignedMarkdown(_autowrap_diff_blocks(output_text))
         app_context.console.print(
             Panel(
                 markdown_response,
@@ -434,84 +742,486 @@ async def _run_agent_response_loop(
         )
 
         log_session_event(f"{cs.SESSION_PREFIX_ASSISTANT}{output_text}")
-        message_history.extend(response.new_messages())
+        _record_and_print_turn_usage(turn_input, turn_output, turn_cost, turn_priced)
         break
 
 
-def _find_image_paths(question: str) -> list[Path]:
+def _find_multimodal_paths(question: str) -> list[Path]:
     try:
         if os.name == "nt":
-            # (H) On Windows, shlex.split with posix=False to preserve backslashes
             tokens = shlex.split(question, posix=False)
         else:
             tokens = shlex.split(question)
     except ValueError:
         tokens = question.split()
 
-    image_paths: list[Path] = []
+    paths: list[Path] = []
     for token in tokens:
-        # (H) Strip quotes if they remain (shlex with posix=False might keep some)
         token = token.strip("'\"")
-        # (H) Check if it looks like an image path
-        if token.lower().endswith(cs.IMAGE_EXTENSIONS):
-            # (H) On Windows, could be C:\... or \...
-            # (H) On POSIX, starts with /
+        if token.lower().endswith(cs.MULTIMODAL_EXTENSIONS):
             p = Path(token)
             if p.is_absolute() or token.startswith("/") or token.startswith("\\"):
-                image_paths.append(p)
-    return image_paths
+                paths.append(p)
+    return paths
 
 
-def _get_path_variants(path_str: str) -> tuple[str, ...]:
+def _path_variants(path_str: str) -> tuple[str, ...]:
     return (
-        path_str.replace(" ", r"\ "),
         f"'{path_str}'",
         f'"{path_str}"',
+        path_str.replace(" ", r"\ "),
         path_str,
     )
 
 
-def _replace_path_in_question(question: str, old_path: str, new_path: str) -> str:
-    for variant in _get_path_variants(old_path):
-        if variant in question:
-            return question.replace(variant, new_path)
-    logger.warning(ls.PATH_NOT_IN_QUESTION.format(path=old_path))
-    return question
+def _guess_media_type(path: Path) -> str:
+    mime, _ = mimetypes.guess_type(str(path))
+    return mime or cs.MIME_TYPE_FALLBACK
 
 
-def _handle_chat_images(question: str, project_root: Path) -> str:
-    image_files = _find_image_paths(question)
-    if not image_files:
+def _build_user_prompt(question: str) -> str | list[UserContent]:
+    paths = _find_multimodal_paths(question)
+    if not paths:
         return question
 
-    tmp_dir = project_root / cs.TMP_DIR
-    tmp_dir.mkdir(exist_ok=True)
-    updated_question = question
-
-    for original_path in image_files:
-        if not original_path.exists() or not original_path.is_file():
-            logger.warning(ls.IMAGE_NOT_FOUND.format(path=original_path))
+    content: list[UserContent] = []
+    remaining = question
+    for path in paths:
+        if not path.exists() or not path.is_file():
+            logger.warning(ls.MULTIMODAL_NOT_FOUND.format(path=path))
             continue
-
+        match_token = next(
+            (v for v in _path_variants(str(path)) if v in remaining), None
+        )
+        if match_token is None:
+            logger.warning(ls.PATH_NOT_IN_QUESTION.format(path=path))
+            continue
+        before, _, after = remaining.partition(match_token)
+        if before.strip():
+            content.append(before.strip())
         try:
-            new_path = tmp_dir / f"{uuid.uuid4()}-{original_path.name}"
-            shutil.copy(original_path, new_path)
-            new_relative = str(new_path.relative_to(project_root))
-            updated_question = _replace_path_in_question(
-                updated_question, str(original_path), new_relative
+            content.append(
+                BinaryContent(
+                    data=path.read_bytes(), media_type=_guess_media_type(path)
+                )
             )
-            logger.info(ls.IMAGE_COPIED.format(path=new_relative))
+            logger.info(ls.MULTIMODAL_ATTACHED.format(path=path))
         except Exception as e:
-            logger.error(ls.IMAGE_COPY_FAILED.format(error=e))
+            logger.error(ls.MULTIMODAL_READ_FAILED.format(path=path, error=e))
+            content.append(match_token)
+        remaining = after
 
-    return updated_question
+    if remaining.strip():
+        content.append(remaining.lstrip())
+
+    return content or question
 
 
-def get_multiline_input(prompt_text: str = cs.PROMPT_ASK_QUESTION) -> str:
+def _permission_mode_label() -> str:
+    return (
+        cs.PERMISSION_MODE_YOLO_LABEL
+        if app_context.session.is_yolo()
+        else cs.PERMISSION_MODE_NORMAL_LABEL
+    )
+
+
+def _git_state() -> tuple[str, bool] | None:
+    repo = app_context.session.target_repo
+    if repo is None or not repo.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--branch"],
+            capture_output=True,
+            text=True,
+            encoding=cs.ENCODING_UTF8,
+            timeout=1.0,
+            check=True,
+            cwd=repo,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    lines = result.stdout.splitlines()
+    if not lines or not lines[0].startswith("## "):
+        return None
+    header = lines[0][3:].split("...", 1)[0].split(" ", 1)[0]
+    if header in ("HEAD", "No"):
+        return None
+    is_dirty = any(line for line in lines[1:])
+    return header, is_dirty
+
+
+def _terminal_columns() -> int:
+    return shutil.get_terminal_size((80, 24)).columns
+
+
+def _format_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+def _token_color(pct: float) -> str:
+    if pct >= cs.TOKEN_THRESHOLD_CRITICAL:
+        return cs.TOKEN_COLOR_CRITICAL
+    if pct >= cs.TOKEN_THRESHOLD_WARNING:
+        return cs.TOKEN_COLOR_WARNING
+    return cs.TOKEN_COLOR_OK
+
+
+def _token_usage() -> tuple[int, int, float]:
+    try:
+        used = int(app_context.session.context_tokens)
+    except (TypeError, ValueError):
+        used = 0
+    try:
+        model_id = settings.active_orchestrator_config.model_id or ""
+    except Exception:
+        model_id = ""
+    bare = model_id.split(":", 1)[-1]
+    max_ctx = cs.MODEL_CONTEXT_WINDOWS.get(bare, cs.DEFAULT_CONTEXT_WINDOW)
+    pct = (used / max_ctx * 100) if max_ctx > 0 else 0.0
+    return used, max_ctx, pct
+
+
+_background_tasks: set[asyncio.Task[None]] = set()
+
+
+def _spawn_background(coro: Coroutine[None, None, None]) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _refresh_context_tokens(messages: list[ModelMessage]) -> None:
+    try:
+        config = settings.active_orchestrator_config
+    except Exception:
+        return
+    if config.provider != cs.Provider.ANTHROPIC or not config.api_key:
+        return
+    try:
+        from .services.anthropic_token_counter import (
+            TokenCountAuthError,
+            count_anthropic_context,
+        )
+
+        count = await count_anthropic_context(config.api_key, config.model_id, messages)
+        app_context.session.context_tokens = count
+    except TokenCountAuthError as e:
+        # A rejected key recurs on EVERY refresh and silently disables the
+        # token counter for the whole session, so debug is the wrong level:
+        # the user has to change something and would otherwise never know
+        # (issue #1493). Warned once per session rather than per refresh --
+        # the counter runs in the background on each turn, and repeating an
+        # unactionable-until-restart message would bury the rest of the log.
+        if not app_context.session.token_auth_warned:
+            app_context.session.token_auth_warned = True
+            logger.warning(ls.CONTEXT_TOKEN_COUNT_AUTH_FAILED.format(error=e))
+    except Exception as e:
+        # Transient failures stay at debug. The next refresh probably works,
+        # and a background retry is not something the user must act on.
+        logger.debug(ls.CONTEXT_TOKEN_COUNT_FAILED.format(error=e))
+
+
+def _prime_context_token_counter(system_prompt: str) -> None:
+    if not system_prompt:
+        return
+    from pydantic_ai.messages import ModelRequest, SystemPromptPart
+
+    baseline_messages: list[ModelMessage] = [
+        ModelRequest(parts=[SystemPromptPart(content=system_prompt)])
+    ]
+    _spawn_background(_refresh_context_tokens(baseline_messages))
+
+
+def _short_model_id() -> tuple[str, str]:
+    try:
+        orch = settings.active_orchestrator_config.model_id or ""
+    except Exception:
+        orch = ""
+    try:
+        cyph = settings.active_cypher_config.model_id or ""
+    except Exception:
+        cyph = ""
+    return orch.split(":", 1)[-1], cyph.split(":", 1)[-1]
+
+
+def _abbreviated_repo(p: Path | None) -> str:
+    if p is None:
+        return ""
+    try:
+        home = Path.home()
+        return (
+            f"~/{p.relative_to(home).as_posix()}"
+            if p.is_relative_to(home)
+            else p.as_posix()
+        )
+    except (ValueError, OSError, RuntimeError):
+        return p.as_posix()
+
+
+def _config_segments() -> list[tuple[str, str]]:
+    orch, cyph = _short_model_id()
+    segments: list[tuple[str, str]] = []
+    if orch:
+        segments.append((cs.STATUS_BAR_CONFIG_LABEL_O, orch))
+    if cyph:
+        segments.append((cs.STATUS_BAR_CONFIG_LABEL_C, cyph))
+    segments.append(
+        (
+            cs.STATUS_BAR_CONFIG_LABEL_EDIT,
+            cs.STATUS_BAR_EDIT_ON
+            if app_context.session.confirm_edits
+            else cs.STATUS_BAR_EDIT_OFF,
+        )
+    )
+    segments.append(
+        (
+            cs.STATUS_BAR_CONFIG_LABEL_INSTRUCTIONS,
+            cs.STATUS_BAR_EDIT_ON
+            if app_context.session.load_cgr_instructions
+            else cs.STATUS_BAR_EDIT_OFF,
+        )
+    )
+    repo = _abbreviated_repo(app_context.session.target_repo)
+    if repo:
+        segments.append((cs.STATUS_BAR_CONFIG_LABEL_REPO, repo))
+    return segments
+
+
+def _config_status_html() -> str:
+    parts = [
+        f'<style fg="{cs.STATUS_BAR_CONFIG_LABEL_COLOR}">{html_escape(label)}:</style>'
+        f'<style fg="{cs.STATUS_BAR_CONFIG_COLOR}">{html_escape(value)}</style>'
+        for label, value in _config_segments()
+    ]
+    return cs.STATUS_BAR_CONFIG_SEPARATOR.join(parts)
+
+
+def _config_status_plain() -> str:
+    parts = [f"{label}:{value}" for label, value in _config_segments()]
+    return cs.STATUS_BAR_CONFIG_SEPARATOR.join(parts)
+
+
+def _config_status_rich() -> Text:
+    line = Text()
+    segments = _config_segments()
+    for i, (label, value) in enumerate(segments):
+        if i > 0:
+            line.append(cs.STATUS_BAR_CONFIG_SEPARATOR, style="dim")
+        line.append(f"{label}:", style=f"bold {cs.STATUS_BAR_CONFIG_LABEL_COLOR}")
+        line.append(value, style=cs.STATUS_BAR_CONFIG_COLOR)
+    return line
+
+
+def _branch_chip_html_and_plain(state: tuple[str, bool] | None) -> tuple[str, str]:
+    if state is None:
+        return "", ""
+    branch, is_dirty = state
+    html_template = (
+        cs.STATUS_BAR_BRANCH_DIRTY_HTML if is_dirty else cs.STATUS_BAR_BRANCH_CLEAN_HTML
+    )
+    plain_template = (
+        cs.STATUS_BAR_BRANCH_DIRTY_PLAIN
+        if is_dirty
+        else cs.STATUS_BAR_BRANCH_CLEAN_PLAIN
+    )
+    return (
+        html_template.format(branch=html_escape(branch)),
+        plain_template.format(branch=branch),
+    )
+
+
+def _branch_chip_rich(state: tuple[str, bool] | None) -> Text:
+    if state is None:
+        return Text()
+    branch, is_dirty = state
+    marker = cs.STATUS_BAR_DIRTY_MARKER if is_dirty else ""
+    chip_style = cs.STATUS_BAR_DIRTY_STYLE if is_dirty else cs.STATUS_BAR_CLEAN_STYLE
+    chip = Text()
+    chip.append(
+        cs.STATUS_BAR_BRANCH_RICH_TEXT.format(branch=branch, marker=marker),
+        style=chip_style,
+    )
+    return chip
+
+
+def _status_bar_label() -> HTML | str:
+    mode = _permission_mode_label()
+    state = _git_state()
+    columns = _terminal_columns()
+    sep_html = (
+        f'<style fg="{cs.STATUS_BAR_SEPARATOR_COLOR}">'
+        f"{cs.STATUS_BAR_SEPARATOR_CHAR * columns}"
+        f"</style>"
+    )
+
+    used, max_ctx, pct = _token_usage()
+    used_str = _format_tokens(used)
+    max_str = _format_tokens(max_ctx)
+    pct_str = f"{pct:.1f}%"
+    token_html = cs.STATUS_BAR_TOKEN_HTML.format(
+        color=_token_color(pct),
+        used=used_str,
+        max_ctx=max_str,
+        pct=pct_str,
+    )
+    token_plain = f"  {used_str} / {max_str} ({pct_str})"
+    body_html = html_escape(mode) + token_html
+    body_plain = mode + token_plain
+
+    config_html = _config_status_html()
+    config_plain = _config_status_plain()
+    branch_html, branch_plain = _branch_chip_html_and_plain(state)
+
+    config_with_branch_html = config_html
+    config_with_branch_plain = config_plain
+    if branch_html:
+        if config_html:
+            config_with_branch_html = f"{config_html}  {branch_html}"
+            config_with_branch_plain = f"{config_plain}  {branch_plain}"
+        else:
+            config_with_branch_html = branch_html
+            config_with_branch_plain = branch_plain
+
+    if not config_with_branch_plain:
+        return HTML(f"{sep_html}\n{body_html}")
+    inline_sep = "  "
+    if len(body_plain) + len(inline_sep) + len(config_with_branch_plain) <= columns:
+        return HTML(f"{sep_html}\n{body_html}{inline_sep}{config_with_branch_html}")
+    return HTML(f"{sep_html}\n{config_with_branch_html}\n{body_html}")
+
+
+def _rich_status_bar() -> Text:
+    body = Text()
+    body.append(_permission_mode_label(), style="dim")
+    used, max_ctx, pct = _token_usage()
+    body.append("  ")
+    body.append(
+        f"{_format_tokens(used)} / {_format_tokens(max_ctx)} ({pct:.1f}%)",
+        style=_token_color(pct),
+    )
+
+    config_line = _config_status_rich()
+    branch_chip = _branch_chip_rich(_git_state())
+    if config_line.plain and branch_chip.plain:
+        config_line.append("  ")
+        config_line.append_text(branch_chip)
+    elif branch_chip.plain:
+        config_line = branch_chip
+
+    if not config_line.plain:
+        return body
+
+    inline_sep = "  "
+    if (
+        len(body.plain) + len(inline_sep) + len(config_line.plain)
+        <= _terminal_columns()
+    ):
+        body.append(inline_sep)
+        body.append_text(config_line)
+        return body
+    return Text("\n").join([config_line, body])
+
+
+@contextmanager
+def _shift_tab_listener():
+    if sys.platform == "win32" or not sys.stdin.isatty():
+        yield
+        return
+    try:
+        import termios
+    except ImportError:
+        yield
+        return
+    fd = sys.stdin.fileno()
+    try:
+        original = termios.tcgetattr(fd)
+    except (termios.error, OSError):
+        yield
+        return
+    try:
+        new_attrs = termios.tcgetattr(fd)
+        new_attrs[3] &= ~(termios.ICANON | termios.ECHO)
+        new_attrs[6][termios.VMIN] = 0
+        new_attrs[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
+        loop = asyncio.get_running_loop()
+        buffer = bytearray()
+
+        def on_input() -> None:
+            try:
+                data = os.read(fd, 1024)
+            except OSError:
+                return
+            if not data:
+                return
+            buffer.extend(data)
+            while cs.SHIFT_TAB_ESCAPE in buffer:
+                idx = buffer.index(cs.SHIFT_TAB_ESCAPE)
+                del buffer[idx : idx + len(cs.SHIFT_TAB_ESCAPE)]
+                app_context.session.cycle_permission_mode()
+
+        loop.add_reader(fd, on_input)
+        try:
+            yield
+        finally:
+            try:
+                loop.remove_reader(fd)
+            except Exception:
+                pass
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, original)
+        except (termios.error, OSError):
+            pass
+
+
+@contextmanager
+def _thinking_with_status_bar(message: str):
+    spinner = Spinner(cs.STATUS_BAR_SPINNER, text=Text.from_markup(message))
+    separator = Text(
+        cs.STATUS_BAR_SEPARATOR_CHAR * _terminal_columns(),
+        style=cs.STATUS_BAR_SEPARATOR_COLOR,
+    )
+
+    def render() -> Group:
+        return Group(separator, spinner, _rich_status_bar())
+
+    with (
+        Live(
+            render(),
+            console=app_context.console,
+            refresh_per_second=4,
+            transient=True,
+        ) as live,
+        _shift_tab_listener(),
+    ):
+
+        async def _refresh_bar() -> None:
+            while True:
+                live.update(render())
+                await asyncio.sleep(0.25)
+
+        refresh_task = asyncio.get_running_loop().create_task(_refresh_bar())
+        try:
+            yield live
+        finally:
+            refresh_task.cancel()
+
+
+def _input_keybindings() -> KeyBindings:
     bindings = KeyBindings()
 
     @bindings.add(cs.KeyBinding.CTRL_J)
     def submit(event: KeyPressEvent) -> None:
+        event.app.exit(result=event.app.current_buffer.text)
+
+    @bindings.add(cs.KeyBinding.CTRL_E)
+    def submit_ctrl_e(event: KeyPressEvent) -> None:
         event.app.exit(result=event.app.current_buffer.text)
 
     @bindings.add(cs.KeyBinding.ENTER)
@@ -522,6 +1232,85 @@ def get_multiline_input(prompt_text: str = cs.PROMPT_ASK_QUESTION) -> str:
     def keyboard_interrupt(event: KeyPressEvent) -> None:
         event.app.exit(exception=KeyboardInterrupt)
 
+    @bindings.add(cs.KeyBinding.SHIFT_TAB)
+    def toggle_permission_mode(event: KeyPressEvent) -> None:
+        app_context.session.cycle_permission_mode()
+        event.app.invalidate()
+
+    # This prompt is multiline, so the arrow keys belong to the buffer while
+    # there is somewhere to move. Only on the first (or last) row do they
+    # fall through to history -- binding them unconditionally would make a
+    # half-written multiline question uneditable (issue #1495).
+    @bindings.add(cs.KeyBinding.UP)
+    def history_previous(event: KeyPressEvent) -> None:
+        buffer = event.current_buffer
+        if buffer.document.cursor_position_row == 0:
+            buffer.history_backward(count=event.arg)
+        else:
+            buffer.cursor_up(count=event.arg)
+
+    @bindings.add(cs.KeyBinding.DOWN)
+    def history_next(event: KeyPressEvent) -> None:
+        buffer = event.current_buffer
+        if buffer.document.cursor_position_row == buffer.document.line_count - 1:
+            buffer.history_forward(count=event.arg)
+        else:
+            buffer.cursor_down(count=event.arg)
+
+    return bindings
+
+
+@lru_cache(maxsize=1)
+def _input_history() -> History:
+    """The chat history, owned separately from the prompt that reads it.
+
+    Kept apart from `_input_session` deliberately. Persistence across turns
+    is the property that matters (issue #1495), and holding it here lets it
+    be exercised without constructing a `PromptSession` -- which attaches to
+    the console and, on a headless CI runner, can block until the job times
+    out.
+    """
+    return InMemoryHistory()
+
+
+def _input_session() -> PromptSession[str]:
+    """The chat prompt, built fresh each turn over the persistent history.
+
+    `get_multiline_input` previously called the bare `prompt()` function,
+    whose own docstring says it "will create a new PromptSession" and which
+    passes `history=None`. Every turn therefore started with an empty
+    history and the up arrow had nothing to recall (issue #1495). Passing
+    `_input_history()` is what fixes that; the session itself is deliberately
+    NOT cached.
+
+    `PromptSession` binds its `Application` to the ambient app session's
+    input and output at construction, so a cached one keeps reading the
+    console it was born under. Across two app sessions that means the
+    second prompt reads the first one's input; when that input is a closed
+    pipe, POSIX returns EOF but a Win32 pipe blocks, which timed out the
+    Windows CI job at thirty minutes. Rebuilding per turn is what the bare
+    `prompt()` did all along and costs nothing at human typing speed.
+    """
+    return PromptSession(history=_input_history())
+
+
+def _remember_input(history: History, text: str) -> None:
+    """Append `text` to `history`, skipping blanks and immediate repeats.
+
+    Blank entries would push the real previous message out of reach for
+    anyone holding Ctrl+J on an empty buffer, and a repeated question
+    should not cost two up-arrows to recall.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return
+    if stripped in list(history.get_strings())[-1:]:
+        return
+    history.append_string(stripped)
+
+
+def get_multiline_input(prompt_text: str = cs.PROMPT_ASK_QUESTION) -> str:
+    session = _input_session()
     clean_prompt = Text.from_markup(prompt_text).plain
 
     print_formatted_text(
@@ -532,16 +1321,19 @@ def get_multiline_input(prompt_text: str = cs.PROMPT_ASK_QUESTION) -> str:
         )
     )
 
-    result = prompt(
+    result = session.prompt(
         "",
         multiline=True,
-        key_bindings=bindings,
+        key_bindings=_input_keybindings(),
         wrap_lines=True,
         style=ORANGE_STYLE,
+        bottom_toolbar=_status_bar_label,
+        refresh_interval=0.5,
     )
     if result is None:
         raise EOFError
     stripped: str = result.strip()
+    _remember_input(session.history, stripped)
     return stripped
 
 
@@ -664,22 +1456,21 @@ async def _run_interactive_loop(
             log_session_event(f"{cs.SESSION_PREFIX_USER}{question}")
 
             if app_context.session.cancelled:
-                question_with_context = question + get_session_context()
+                question_text = question + get_session_context()
                 app_context.session.reset_cancelled()
             else:
-                question_with_context = question
+                question_text = question
 
-            question_with_context = _handle_chat_images(
-                question_with_context, project_root
-            )
+            user_prompt: str | list[UserContent] = _build_user_prompt(question_text)
 
             await _run_agent_response_loop(
                 rag_agent,
                 message_history,
-                question_with_context,
+                user_prompt,
                 config,
                 tool_names,
                 model_override,
+                model_override_config,
             )
 
             initial_question = None
@@ -904,7 +1695,7 @@ def prompt_for_unignored_directories(
     cli_excludes: list[str] | None = None,
 ) -> frozenset[str]:
     detected = detect_excludable_directories(repo_path)
-    cgrignore = load_cgrignore_patterns(repo_path)
+    cgrignore = load_ignore_patterns(repo_path)
     cli_patterns = frozenset(cli_excludes) if cli_excludes else frozenset()
     pre_excluded = cli_patterns | cgrignore.exclude
 
@@ -961,75 +1752,181 @@ def prompt_for_unignored_directories(
 
 
 def _validate_provider_config(role: cs.ModelRole, config: ModelConfig) -> None:
-    from .providers.base import get_provider_from_config
+    """Fail fast at startup when a model role is misconfigured."""
+    from .providers.base import get_provider_from_config, validate_model_id
 
     try:
         provider = get_provider_from_config(config)
         provider.validate_config()
+        # Credentials only get you as far as a 404: `validate_config` takes
+        # no model id, so a typo used to surface as a raw provider error at
+        # the first query instead of here (issue #1492).
+        validate_model_id(config)
     except Exception as e:
         raise ValueError(ex.CONFIG.format(role=role.value.title(), error=e)) from e
 
 
+def _cli_query_scope(active_projects: list[str] | None) -> str | None:
+    """The project a CLI session's graph queries are restricted to, if any.
+
+    EXACTLY one active project, not the first of several: a session that
+    activated more than one asked for all of them, and narrowing to one
+    would silently drop results the user deliberately included.
+
+    The CLI shares the cross-project bleed the MCP server had (issue
+    #1494); it is simply less visible when a session points at one repo.
+    """
+    if not active_projects or len(active_projects) != 1:
+        return None
+    return active_projects[0]
+
+
 def _initialize_services_and_agent(
-    repo_path: str, ingestor: QueryProtocol
-) -> tuple[Agent[None, str | DeferredToolRequests], ConfirmationToolNames]:
+    repo_path: str,
+    ingestor: QueryProtocol,
+    active_projects: list[str] | None = None,
+) -> tuple[Agent[None, str | DeferredToolRequests], ConfirmationToolNames, str]:
+    """Build the orchestrator, its tools, and the shared session services.
+
+    Tools returning repository content share one `ReadContentRecord`, and web
+    search is deliberately absent from the orchestrator: it belongs to the
+    research sub-agent instead (issue #1128).
+    """
     _validate_provider_config(
         cs.ModelRole.ORCHESTRATOR, settings.active_orchestrator_config
     )
     _validate_provider_config(cs.ModelRole.CYPHER, settings.active_cypher_config)
 
-    cypher_generator = CypherGenerator()
+    cypher_generator = CypherGenerator(active_projects=active_projects)
     code_retriever = CodeRetriever(project_root=repo_path, ingestor=ingestor)
     file_reader = FileReader(project_root=repo_path)
     file_writer = FileWriter(project_root=repo_path)
     file_editor = FileEditor(project_root=repo_path)
     shell_commander = ShellCommander(
-        project_root=repo_path, timeout=settings.SHELL_COMMAND_TIMEOUT
+        project_root=repo_path,
+        timeout=settings.SHELL_COMMAND_TIMEOUT,
+        is_yolo=app_context.session.is_yolo,
     )
     directory_lister = DirectoryLister(project_root=repo_path)
-    document_analyzer = DocumentAnalyzer(project_root=repo_path)
+    ast_grep_service = AstGrepService(project_root=repo_path)
 
-    query_tool = create_query_tool(ingestor, cypher_generator, app_context.console)
-    code_tool = create_code_retrieval_tool(code_retriever)
-    file_reader_tool = create_file_reader_tool(file_reader)
+    # Tools returning raw repository content feed this record; the web search
+    # egress gate refuses queries carrying verbatim spans of it (issue #1128).
+    read_record = ReadContentRecord()
+
+    query_tool = create_query_tool(
+        ingestor,
+        cypher_generator,
+        app_context.console,
+        project_name=_cli_query_scope(active_projects),
+    )
+    code_tool = create_code_retrieval_tool(code_retriever, read_record)
+    file_reader_tool = create_file_reader_tool(file_reader, read_record)
     file_writer_tool = create_file_writer_tool(file_writer)
     file_editor_tool = create_file_editor_tool(file_editor)
-    shell_command_tool = create_shell_command_tool(shell_commander)
+    shell_command_tool = create_shell_command_tool(shell_commander, read_record)
     directory_lister_tool = create_directory_lister_tool(directory_lister)
-    document_analyzer_tool = create_document_analyzer_tool(document_analyzer)
-    semantic_search_tool = create_semantic_search_tool()
-    function_source_tool = create_get_function_source_tool()
+    semantic_search_tool = create_semantic_search_tool(ingestor)
+    function_source_tool = create_get_function_source_tool(ingestor, read_record)
+    structural_search_tool = create_structural_search_tool(
+        ast_grep_service, read_record
+    )
+    structural_editor_tool = create_structural_editor_tool(
+        ast_grep_service, read_record
+    )
+    find_duplicates_tool = create_find_duplicates_tool(ingestor)
+
+    agentic_tools = [
+        query_tool,
+        code_tool,
+        file_reader_tool,
+        file_writer_tool,
+        file_editor_tool,
+        shell_command_tool,
+        directory_lister_tool,
+        semantic_search_tool,
+        function_source_tool,
+        structural_search_tool,
+        structural_editor_tool,
+        find_duplicates_tool,
+    ]
+
+    # Web search is deliberately NOT an orchestrator tool (issue #1128): it
+    # lives alone in a leaf research sub-agent, so external web content never
+    # shares a context with repository reads and shell. The orchestrator gets
+    # a `research` delegation tool whose summary crosses back as data. The
+    # search backend registers unconditionally as before: keyless DuckDuckGo
+    # by default, WEB_SEARCH_PROVIDER=serpdive (with SERPDIVE_API_KEY) opt-in.
+    # Built lazily on first research call: constructing the sub-agent's model
+    # validates the provider (an Ollama liveness probe, for one), which
+    # ordinary sessions should not pay for when they never research anything.
+    def _build_research_agent() -> Agent:
+        """Construct the research sub-agent with web_search as its only tool."""
+        return create_research_agent(
+            [create_web_search_tool(make_web_searcher(), read_record)]
+        )
+
+    agentic_tools.append(
+        create_research_tool(
+            _build_research_agent, read_record, on_usage=_absorb_research_usage
+        )
+    )
 
     confirmation_tool_names = ConfirmationToolNames(
         replace_code=file_editor_tool.name,
         create_file=file_writer_tool.name,
         shell_command=shell_command_tool.name,
+        structural_replace=structural_editor_tool.name,
     )
 
-    rag_agent = create_rag_orchestrator(
-        tools=[
-            query_tool,
-            code_tool,
-            file_reader_tool,
-            file_writer_tool,
-            file_editor_tool,
-            shell_command_tool,
-            directory_lister_tool,
-            document_analyzer_tool,
-            semantic_search_tool,
-            function_source_tool,
-        ]
+    rag_agent, system_prompt = create_rag_orchestrator(
+        tools=agentic_tools,
+        project_root=Path(repo_path),
+        load_instructions=app_context.session.load_cgr_instructions,
+        active_projects=active_projects,
     )
-    return rag_agent, confirmation_tool_names
+    return rag_agent, confirmation_tool_names, system_prompt
 
 
-async def main_async(repo_path: str, batch_size: int) -> None:
-    project_root = _setup_common_initialization(repo_path)
-
-    table = _create_configuration_table(repo_path)
-    app_context.console.print(table)
+def main_single_query(
+    repo_path: str,
+    batch_size: int,
+    question: str,
+    active_projects: list[str] | None = None,
+    output_format: cs.QueryFormat = cs.QueryFormat.TABLE,
+) -> None:
+    _setup_common_initialization(repo_path)
+    # Override logger to stderr so stdout is clean for scripted output
+    logger.remove()
+    logger.add(sys.stderr, level=cs.LOG_LEVEL_ERROR, format=cs.LOG_FORMAT)
 
     with connect_memgraph(batch_size) as ingestor:
+        rag_agent, _, _ = _initialize_services_and_agent(
+            repo_path, ingestor, active_projects=active_projects
+        )
+        response = asyncio.run(rag_agent.run(question, message_history=[]))
+        if output_format == cs.QueryFormat.JSON:
+            payload = QueryJsonOutput(query=question, response=str(response.output))
+            print(json.dumps(payload, ensure_ascii=False))  # noqa: T201
+        else:
+            print(response.output)  # noqa: T201
+
+
+async def main_async(
+    repo_path: str,
+    batch_size: int,
+    active_projects: list[str] | None = None,
+    show_config_table: bool = True,
+    pre_chat_sync: Callable[[], None] | None = None,
+    pre_chat_sync_message: str = cs.MSG_SYNCING_KNOWLEDGE_GRAPH,
+) -> None:
+    project_root = _setup_common_initialization(repo_path)
+
+    if show_config_table:
+        table = _create_configuration_table(repo_path)
+        app_context.console.print(table)
+
+    async with connect_memgraph(batch_size) as ingestor:
         app_context.console.print(style(cs.MSG_CONNECTED_MEMGRAPH, cs.Color.GREEN))
         app_context.console.print(
             Panel(
@@ -1038,8 +1935,24 @@ async def main_async(repo_path: str, batch_size: int) -> None:
             )
         )
 
-        rag_agent, tool_names = _initialize_services_and_agent(repo_path, ingestor)
+        rag_agent, tool_names, system_prompt = _initialize_services_and_agent(
+            repo_path, ingestor, active_projects=active_projects
+        )
+        _prime_context_token_counter(system_prompt)
+
+        if pre_chat_sync is not None:
+            await _run_pre_chat_sync(pre_chat_sync, pre_chat_sync_message)
+
         await run_chat_loop(rag_agent, [], project_root, tool_names)
+
+
+async def _run_pre_chat_sync(task: Callable[[], None], message: str) -> None:
+    logger.disable("codebase_rag")
+    try:
+        with _thinking_with_status_bar(message):
+            await asyncio.to_thread(task)
+    finally:
+        logger.enable("codebase_rag")
 
 
 async def main_optimize_async(
@@ -1065,12 +1978,13 @@ async def main_optimize_async(
 
     effective_batch_size = settings.resolve_batch_size(batch_size)
 
-    with connect_memgraph(effective_batch_size) as ingestor:
+    async with connect_memgraph(effective_batch_size) as ingestor:
         app_context.console.print(style(cs.MSG_CONNECTED_MEMGRAPH, cs.Color.GREEN))
 
-        rag_agent, tool_names = _initialize_services_and_agent(
+        rag_agent, tool_names, system_prompt = _initialize_services_and_agent(
             target_repo_path, ingestor
         )
+        _prime_context_token_counter(system_prompt)
         await run_optimization_loop(
             rag_agent, [], project_root, language, tool_names, reference_document
         )

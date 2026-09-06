@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loguru import logger
 from pydantic_ai import Agent, DeferredToolRequests, Tool
+from pydantic_ai.agent import AgentRetries
 
 from .. import constants as cs
 from .. import exceptions as ex
 from .. import logs as ls
-from ..config import ModelConfig, settings
+from ..config import ModelConfig, load_cgr_instructions, settings
 from ..prompts import (
-    CYPHER_SYSTEM_PROMPT,
-    LOCAL_CYPHER_SYSTEM_PROMPT,
+    build_cypher_system_prompt,
+    build_local_cypher_system_prompt,
     build_rag_orchestrator_prompt,
+    build_research_agent_prompt,
 )
 from ..providers.base import get_provider_from_config
 
@@ -27,16 +30,8 @@ def _create_provider_model(config: ModelConfig) -> Model:
 
 
 def _clean_cypher_response(response_text: str) -> str:
-    """Clean LLM response to extract pure Cypher query.
-
-    Handles markdown formatting that models sometimes output:
-    - Triple backticks (```cypher ... ```)
-    - Bold text (**Cypher Query:**)
-    - Headers and other markdown
-    """
     query = response_text.strip()
 
-    # Extract content from code blocks (```cypher ... ``` or ``` ... ```)
     if "```" in query:
         parts = query.split("```")
         if len(parts) >= 3:
@@ -45,7 +40,6 @@ def _clean_cypher_response(response_text: str) -> str:
                 block = block[len("cypher") :]
             query = block.strip()
     else:
-        # Remove markdown bold/headers (e.g., **Cypher Query:**)
         while "**" in query:
             start = query.index("**")
             end = query.find("**", start + 2)
@@ -55,9 +49,7 @@ def _clean_cypher_response(response_text: str) -> str:
             if after < len(query) and query[after] == ":":
                 after += 1
             query = query[:start] + query[after:].lstrip()
-        # Remove single backticks
         query = query.replace(cs.CYPHER_BACKTICK, "")
-        # Remove "cypher" prefix if present
         if query.lower().startswith(cs.CYPHER_PREFIX):
             query = query[len(cs.CYPHER_PREFIX) :].strip()
 
@@ -82,6 +74,10 @@ _CYPHER_DANGEROUS_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
+_VARLEN_PATTERN = re.compile(r"\[[^\]]*?\*([^\]]*)\]")
+_PROCEDURE_CALL_PATTERN = re.compile(r"\bCALL\s+([\w\.]+)", re.IGNORECASE)
+
+
 def _validate_cypher_read_only(query: str) -> None:
     upper_query = query.upper()
     for keyword, pattern in _CYPHER_DANGEROUS_PATTERNS:
@@ -91,18 +87,41 @@ def _validate_cypher_read_only(query: str) -> None:
             )
 
 
+def _validate_no_unbounded_paths(query: str) -> None:
+    for match in _VARLEN_PATTERN.finditer(query):
+        spec = match.group(1).strip()
+        if not spec:
+            raise ex.LLMGenerationError(ex.LLM_UNBOUNDED_PATH.format(query=query))
+        if ".." in spec:
+            upper = spec.split("..", 1)[1].lstrip()
+            if not upper or not upper[0].isdigit():
+                raise ex.LLMGenerationError(ex.LLM_UNBOUNDED_PATH.format(query=query))
+
+
+def _validate_call_procedures(query: str) -> None:
+    for match in _PROCEDURE_CALL_PATTERN.finditer(query):
+        name = match.group(1)
+        if not any(
+            name.startswith(prefix) for prefix in cs.CYPHER_ALLOWED_PROCEDURE_PREFIXES
+        ):
+            raise ex.LLMGenerationError(
+                ex.LLM_DISALLOWED_PROCEDURE.format(name=name, query=query)
+            )
+
+
 class CypherGenerator:
     __slots__ = ("agent",)
 
-    def __init__(self) -> None:
+    def __init__(self, active_projects: list[str] | None = None) -> None:
+        """Build the Cypher agent, scoped to the given projects if any."""
         try:
             config = settings.active_cypher_config
             llm = _create_provider_model(config)
 
             system_prompt = (
-                LOCAL_CYPHER_SYSTEM_PROMPT
+                build_local_cypher_system_prompt(active_projects)
                 if config.provider == cs.Provider.OLLAMA
-                else CYPHER_SYSTEM_PROMPT
+                else build_cypher_system_prompt(active_projects)
             )
 
             self.agent = Agent(
@@ -115,6 +134,7 @@ class CypherGenerator:
             raise ex.LLMGenerationError(ex.LLM_INIT_CYPHER.format(error=e)) from e
 
     async def generate(self, natural_language_query: str) -> str:
+        """Translate a natural-language question into a read-only Cypher query."""
         logger.info(ls.CYPHER_GENERATING.format(query=natural_language_query))
         try:
             result = await self.agent.run(natural_language_query)
@@ -128,6 +148,8 @@ class CypherGenerator:
 
             query = _clean_cypher_response(result.output)
             _validate_cypher_read_only(query)
+            _validate_no_unbounded_paths(query)
+            _validate_call_procedures(query)
             logger.info(ls.CYPHER_GENERATED.format(query=query))
             return query
         except Exception as e:
@@ -135,18 +157,59 @@ class CypherGenerator:
             raise ex.LLMGenerationError(ex.LLM_GENERATION_FAILED.format(error=e)) from e
 
 
-def create_rag_orchestrator(tools: list[Tool]) -> Agent:
+def create_research_agent(tools: list[Tool]) -> Agent:
+    """Build the leaf research sub-agent, the trust boundary for external web
+    content (issue #1128).
+
+    This agent holds ONLY the external-content tools it is handed: no
+    repository reads, no shell, so a poisoned page has no repository tool to
+    steer. Its transcript never reaches the orchestrator; only the final
+    summary crosses back, wrapped as data by the research tool.
+    """
+    try:
+        config = settings.active_orchestrator_config
+        llm = _create_provider_model(config)
+        return Agent(
+            model=llm,
+            system_prompt=build_research_agent_prompt(),
+            tools=tools,
+            retries=settings.AGENT_RETRIES,
+            output_type=str,
+        )
+    except Exception as e:
+        raise ex.LLMGenerationError(ex.LLM_INIT_RESEARCH.format(error=e)) from e
+
+
+def create_rag_orchestrator(
+    tools: list[Tool],
+    project_root: Path | None = None,
+    load_instructions: bool = True,
+    active_projects: list[str] | None = None,
+) -> tuple[Agent, str]:
+    """Build the main agent and return it with its system prompt."""
     try:
         config = settings.active_orchestrator_config
         llm = _create_provider_model(config)
 
-        return Agent(
+        project_instructions = (
+            load_cgr_instructions(project_root) if load_instructions else None
+        )
+        system_prompt = build_rag_orchestrator_prompt(
+            tools,
+            project_instructions=project_instructions,
+            active_projects=active_projects,
+        )
+
+        agent = Agent(
             model=llm,
-            system_prompt=build_rag_orchestrator_prompt(tools),
+            system_prompt=system_prompt,
             tools=tools,
-            retries=settings.AGENT_RETRIES,
-            output_retries=settings.ORCHESTRATOR_OUTPUT_RETRIES,
+            retries=AgentRetries(
+                tools=settings.AGENT_RETRIES,
+                output=settings.ORCHESTRATOR_OUTPUT_RETRIES,
+            ),
             output_type=[str, DeferredToolRequests],
         )
+        return agent, system_prompt
     except Exception as e:
         raise ex.LLMGenerationError(ex.LLM_INIT_ORCHESTRATOR.format(error=e)) from e
