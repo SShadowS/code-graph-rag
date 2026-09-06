@@ -6,6 +6,7 @@ from loguru import logger
 
 from ... import constants as cs
 from .object_extractor import ObjectRegistry
+from .utils import collect_descendants, object_body
 
 if TYPE_CHECKING:
     from ...services import IngestorProtocol
@@ -39,17 +40,8 @@ def _find_children(node: ASTNode, type_name: str) -> list[ASTNode]:
     return [child for child in node.children if child.type == type_name]
 
 
-def _collect_descendants(node: ASTNode, type_name: str) -> list[ASTNode]:
-    result: list[ASTNode] = []
-    for child in node.children:
-        if child.type == type_name:
-            result.append(child)
-        result.extend(_collect_descendants(child, type_name))
-    return result
-
-
 def _extract_source_table(node: ASTNode) -> str | None:
-    for child in node.children:
+    for child in object_body(node).children:
         if child.type != cs.TS_AL_PROPERTY:
             continue
         prop_name_node = _find_child(child, "property_name")
@@ -94,18 +86,18 @@ class AlPropertyReader:
             )
             logger.debug(f"AL BINDS_TABLE: {parent_qn} -> {source_table}")
 
-        layout_section = _find_child(node, cs.TS_AL_LAYOUT_SECTION)
+        layout_section = _find_child(object_body(node), cs.TS_AL_LAYOUT_SECTION)
         if layout_section:
-            page_fields = _collect_descendants(layout_section, "page_field")
+            page_fields = collect_descendants(layout_section, "page_field")
             for pf in page_fields:
                 qi = _find_child(pf, "quoted_identifier")
                 if qi is not None:
                     field_name = _strip_quotes(_node_text(qi))
                     logger.debug(f"AL page field: {parent_qn} displays {field_name}")
 
-        actions_section = _find_child(node, cs.TS_AL_ACTIONS_SECTION)
+        actions_section = _find_child(object_body(node), cs.TS_AL_ACTIONS_SECTION)
         if actions_section:
-            action_nodes = _collect_descendants(
+            action_nodes = collect_descendants(
                 actions_section, cs.TS_AL_ACTION_DECLARATION
             )
             for action_node in action_nodes:
@@ -137,13 +129,13 @@ class AlPropertyReader:
         logger.debug(f"AL action: {action_qn}")
 
     def _process_dataitems(self, node: ASTNode, parent_qn: str) -> None:
-        dataset_section = _find_child(node, cs.TS_AL_DATASET_SECTION)
+        dataset_section = _find_child(object_body(node), cs.TS_AL_DATASET_SECTION)
         if dataset_section is None:
             return
 
         dataitem_types = (cs.TS_AL_REPORT_DATAITEM, cs.TS_AL_QUERY_DATAITEM)
         for dt in dataitem_types:
-            for di_node in _collect_descendants(dataset_section, dt):
+            for di_node in collect_descendants(dataset_section, dt):
                 self._process_dataitem(di_node, parent_qn)
 
     def _process_dataitem(self, di_node: ASTNode, parent_qn: str) -> None:

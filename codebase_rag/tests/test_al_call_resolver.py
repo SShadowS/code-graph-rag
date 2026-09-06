@@ -102,3 +102,38 @@ def test_unresolved_calls_ignored():
         r for r in ingestor.relationships if r[1] == cs.RelationshipType.CALLS
     ]
     assert len(calls_rels) == 0
+
+
+AL_MEMBER_CALL = b"""
+table 50300 "Customer"
+{
+    fields { field(1; "No."; Code[20]) { } }
+
+    procedure Bar()
+    begin
+    end;
+}
+
+codeunit 50301 "MemberCU"
+{
+    procedure UseIt()
+    var
+        Cust: Record "Customer";
+    begin
+        Cust.Bar();
+    end;
+}
+"""
+
+
+def test_member_call_resolved_through_record_variable():
+    ingestor, registry, proc_registry = _setup(AL_MEMBER_CALL)
+    resolver = AlCallResolver(ingestor)
+    resolver.resolve_calls(registry, proc_registry)
+
+    calls_rels = [
+        r for r in ingestor.relationships if r[1] == cs.RelationshipType.CALLS
+    ]
+    assert len(calls_rels) == 1
+    assert calls_rels[0][0][2] == "Codeunit.50301.MemberCU.UseIt"
+    assert calls_rels[0][2][2] == "Table.50300.Customer.Bar"

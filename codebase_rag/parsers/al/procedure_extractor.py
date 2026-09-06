@@ -6,7 +6,7 @@ from loguru import logger
 
 from ... import constants as cs
 from .object_extractor import ObjectRegistry
-from .utils import build_al_qualified_name
+from .utils import build_al_qualified_name, object_body
 
 if TYPE_CHECKING:
     from ...services import IngestorProtocol
@@ -61,11 +61,11 @@ def _extract_access_modifier(node: ASTNode) -> str | None:
     return None
 
 
-def _is_event_subscriber(parent_node: ASTNode, proc_index: int) -> bool:
+def _is_event_subscriber(siblings: list[ASTNode], proc_index: int) -> bool:
     # (H) Check if previous sibling is an attribute_item with EventSubscriber
     if proc_index <= 0:
         return False
-    prev_sibling = parent_node.children[proc_index - 1]
+    prev_sibling = siblings[proc_index - 1]
     if prev_sibling.type != cs.TS_AL_ATTRIBUTE_ITEM:
         return False
     content = _find_child(prev_sibling, "attribute_content")
@@ -112,7 +112,7 @@ class AlProcedureExtractor:
         object_id: int | None,
         proc_registry: dict[str, str],
     ) -> None:
-        children = node.children
+        children = object_body(node).children
         for idx, child in enumerate(children):
             if child.type not in PROCEDURE_NODE_TYPES:
                 continue
@@ -140,7 +140,7 @@ class AlProcedureExtractor:
             elif child.type == cs.TS_AL_EVENT_DECLARATION:
                 extra_labels = (cs.NodeLabel.TRIGGER,)
                 props["trigger_type"] = name
-            elif _is_event_subscriber(node, idx):
+            elif _is_event_subscriber(children, idx):
                 extra_labels = (cs.NodeLabel.EVENT_SUBSCRIBER,)
             else:
                 extra_labels = (cs.NodeLabel.PROCEDURE,)

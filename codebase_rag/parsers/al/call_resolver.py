@@ -8,6 +8,7 @@ from loguru import logger
 from ... import constants as cs
 from .object_extractor import ObjectRegistry
 from .procedure_extractor import PROCEDURE_NODE_TYPES
+from .utils import collect_descendants, object_body
 
 if TYPE_CHECKING:
     from ...services import IngestorProtocol
@@ -31,7 +32,7 @@ def _extract_var_types(proc_node: ASTNode) -> dict[str, str]:
     var_types: dict[str, str] = {}
     for child in proc_node.children:
         if child.type == cs.TS_AL_VAR_SECTION:
-            for var_decl in child.children:
+            for var_decl in collect_descendants(child, cs.TS_AL_VARIABLE_DECLARATION):
                 if var_decl.type == cs.TS_AL_VARIABLE_DECLARATION:
                     var_name: str | None = None
                     table_name: str | None = None
@@ -101,7 +102,7 @@ class AlCallResolver:
         sibling_procs: list[str],
         procedure_registry: dict[str, str],
     ) -> None:
-        for child in node.children:
+        for child in object_body(node).children:
             if child.type not in PROCEDURE_NODE_TYPES:
                 continue
 

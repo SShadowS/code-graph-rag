@@ -72,3 +72,19 @@ def build_al_qualified_name(
     if child_name:
         parts.append(child_name)
     return cs.SEPARATOR_DOT.join(parts)
+
+
+def object_body(node: ASTNode) -> ASTNode:
+    for child in node.children:
+        if child.type == cs.TS_AL_DECLARATION_BODY:
+            return child
+    return node
+
+
+def collect_descendants(node: ASTNode, type_name: str) -> list[ASTNode]:
+    result: list[ASTNode] = []
+    for child in node.children:
+        if child.type == type_name:
+            result.append(child)
+        result.extend(collect_descendants(child, type_name))
+    return result

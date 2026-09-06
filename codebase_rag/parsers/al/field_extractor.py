@@ -6,6 +6,7 @@ from loguru import logger
 
 from ... import constants as cs
 from .object_extractor import ObjectRegistry
+from .utils import collect_descendants, object_body
 
 if TYPE_CHECKING:
     from ...services import IngestorProtocol
@@ -49,11 +50,13 @@ class AlFieldExtractor:
             self._extract_key_section(node, qn)
 
     def _extract_field_section(self, node: ASTNode, parent_qn: str) -> None:
-        fields_section = _find_child(node, cs.TS_AL_FIELDS_SECTION)
+        fields_section = _find_child(object_body(node), cs.TS_AL_FIELDS_SECTION)
         if fields_section is None:
             return
 
-        for field_decl in _find_children(fields_section, cs.TS_AL_FIELD_DECLARATION):
+        for field_decl in collect_descendants(
+            fields_section, cs.TS_AL_FIELD_DECLARATION
+        ):
             self._process_field(field_decl, parent_qn)
 
     def _process_field(self, field_decl: ASTNode, parent_qn: str) -> None:
@@ -93,11 +96,11 @@ class AlFieldExtractor:
         logger.debug(f"AL field: {field_qn}")
 
     def _extract_key_section(self, node: ASTNode, parent_qn: str) -> None:
-        keys_section = _find_child(node, cs.TS_AL_KEYS_SECTION)
+        keys_section = _find_child(object_body(node), cs.TS_AL_KEYS_SECTION)
         if keys_section is None:
             return
 
-        for key_decl in _find_children(keys_section, cs.TS_AL_KEY_DECLARATION):
+        for key_decl in collect_descendants(keys_section, cs.TS_AL_KEY_DECLARATION):
             self._process_key(key_decl, parent_qn)
 
     def _process_key(self, key_decl: ASTNode, parent_qn: str) -> None:
