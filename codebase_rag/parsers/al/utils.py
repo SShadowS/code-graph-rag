@@ -75,10 +75,7 @@ def build_al_qualified_name(
 
 
 def object_body(node: ASTNode) -> ASTNode:
-    for child in node.children:
-        if child.type == cs.TS_AL_DECLARATION_BODY:
-            return child
-    return node
+    return node.child_by_field_name(cs.FIELD_BODY) or node
 
 
 def collect_descendants(node: ASTNode, type_name: str) -> list[ASTNode]:

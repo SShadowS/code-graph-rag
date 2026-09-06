@@ -1,7 +1,6 @@
 TS_AL_CODEUNIT_DECLARATION = "codeunit_declaration"
 TS_AL_TABLE_DECLARATION = "table_declaration"
 TS_AL_TABLE_EXTENSION_DECLARATION = "tableextension_declaration"
-TS_AL_DECLARATION_BODY = "declaration_body"
 TS_AL_PAGE_DECLARATION = "page_declaration"
 TS_AL_PAGE_EXTENSION_DECLARATION = "pageextension_declaration"
 TS_AL_PAGE_CUSTOMIZATION_DECLARATION = "pagecustomization_declaration"

@@ -163,3 +163,47 @@ def test_procedure_registry_returned():
         == "Codeunit.50100.MyCodeunit"
     )
     assert proc_registry["Table.50101.MyTable.OnInsert"] == "Table.50101.MyTable"
+
+
+BODYLESS_PROCEDURES_AL = b"""
+interface "My Iface"
+{
+    procedure Foo();
+    procedure Bar(x: Integer): Boolean;
+}
+
+controladdin "My Addin"
+{
+    procedure Ping();
+}
+
+codeunit 50200 "Empty CU"
+{
+}
+"""
+
+
+def _procedures_for(src: bytes):
+    root = _parse(src)
+    ingestor = MockIngestor()
+    registry = AlObjectExtractor(ingestor, Path("/repo")).extract_objects(
+        root, Path("/repo/test.al"), "test"
+    )
+    proc_registry = AlProcedureExtractor(ingestor).extract_procedures(registry)
+    return ingestor, proc_registry
+
+
+def test_interface_procedures_extracted():
+    _ingestor, proc_registry = _procedures_for(BODYLESS_PROCEDURES_AL)
+    assert "Interface.0.My Iface.Foo" in proc_registry
+    assert "Interface.0.My Iface.Bar" in proc_registry
+
+
+def test_controladdin_procedures_extracted():
+    _ingestor, proc_registry = _procedures_for(BODYLESS_PROCEDURES_AL)
+    assert "ControlAddin.0.My Addin.Ping" in proc_registry
+
+
+def test_empty_object_yields_no_procedures():
+    _ingestor, proc_registry = _procedures_for(BODYLESS_PROCEDURES_AL)
+    assert not [qn for qn in proc_registry if qn.startswith("Codeunit.50200")]
