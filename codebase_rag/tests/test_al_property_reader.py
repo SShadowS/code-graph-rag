@@ -91,7 +91,7 @@ def test_binds_table_relationship():
         cs.KEY_QUALIFIED_NAME,
         "Page.50103.MyPage",
     )
-    assert rel[2] == (cs.NodeLabel.CLASS, cs.KEY_NAME, "MyTable")
+    assert rel[2] == (cs.NodeLabel.TABLE, cs.KEY_NAME, "MyTable")
 
 
 def test_action_nodes_created():
@@ -179,7 +179,7 @@ def test_reads_table_relationship():
         cs.KEY_QUALIFIED_NAME,
         "Report.50104.MyReport.Customer",
     )
-    assert rel[2] == (cs.NodeLabel.CLASS, cs.KEY_NAME, "Customer")
+    assert rel[2] == (cs.NodeLabel.TABLE, cs.KEY_NAME, "Customer")
 
 
 DISPLAY_PAGE_AL = b"""

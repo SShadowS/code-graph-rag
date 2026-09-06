@@ -101,7 +101,7 @@ class AlPropertyReader:
             self.ingestor.ensure_relationship_batch(
                 (cs.NodeLabel.CLASS, cs.KEY_QUALIFIED_NAME, parent_qn),
                 cs.RelationshipType.BINDS_TABLE,
-                (cs.NodeLabel.CLASS, cs.KEY_NAME, source_table),
+                (cs.NodeLabel.TABLE, cs.KEY_NAME, source_table),
             )
             logger.debug(f"AL BINDS_TABLE: {parent_qn} -> {source_table}")
 
@@ -194,7 +194,7 @@ class AlPropertyReader:
             self.ingestor.ensure_relationship_batch(
                 (cs.NodeLabel.DATA_ITEM, cs.KEY_QUALIFIED_NAME, dataitem_qn),
                 cs.RelationshipType.READS_TABLE,
-                (cs.NodeLabel.CLASS, cs.KEY_NAME, source_table),
+                (cs.NodeLabel.TABLE, cs.KEY_NAME, source_table),
             )
 
         logger.debug(f"AL dataitem: {dataitem_qn}")

@@ -1259,7 +1259,7 @@ RELATIONSHIP_SCHEMAS: tuple[RelationshipSchema, ...] = (
     RelationshipSchema(
         (NodeLabel.CLASS,),
         RelationshipType.BINDS_TABLE,
-        (NodeLabel.CLASS,),
+        (NodeLabel.TABLE,),
     ),
     RelationshipSchema(
         (NodeLabel.CLASS,),
@@ -1289,7 +1289,7 @@ RELATIONSHIP_SCHEMAS: tuple[RelationshipSchema, ...] = (
     RelationshipSchema(
         (NodeLabel.DATA_ITEM,),
         RelationshipType.READS_TABLE,
-        (NodeLabel.CLASS,),
+        (NodeLabel.TABLE,),
     ),
     RelationshipSchema(
         (NodeLabel.CLASS,),
