@@ -596,7 +596,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'semantic'", specifier = ">=2.6.0" },
     { name = "transformers", marker = "extra == 'semantic'", specifier = ">=4.0.0" },
     { name = "tree-sitter", specifier = "==0.25.2" },
-    { name = "tree-sitter-al", specifier = ">=0.1.0" },
+    { name = "tree-sitter-al", specifier = ">=3.0.1" },
     { name = "tree-sitter-c", marker = "extra == 'treesitter-full'", specifier = ">=0.24.1" },
     { name = "tree-sitter-cpp", marker = "extra == 'treesitter-full'", specifier = ">=0.23.0" },
     { name = "tree-sitter-go", marker = "extra == 'treesitter-full'", specifier = ">=0.23.4" },
@@ -4275,15 +4275,15 @@ wheels = [
 
 [[package]]
 name = "tree-sitter-al"
-version = "2.0.2"
+version = "3.0.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c9/29/e84d5d5570a353249d190377a6a1ccccd9387d8acd01ab3be1c006f1ce47/tree_sitter_al-2.0.2.tar.gz", hash = "sha256:14d51e90115f1aef1ebdc3ab75c2a7f900170c8afb1e7eedd860d87ac7072703", size = 552027 }
+sdist = { url = "https://files.pythonhosted.org/packages/dc/d7/514d0bb888bdfcda0fb4c6c740674fdd81b6673501a0b7fd9a3e539475e8/tree_sitter_al-3.0.1.tar.gz", hash = "sha256:a2f606763a1decce9f9fa63848413e0d2f81e2571015ae264aca8222ba6e8ca6", size = 1445373 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e0/8b/28d4bf58637daafe38616a65838ecc67be210a0b605ebe9e1b7e22f0aa8a/tree_sitter_al-2.0.2-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:7ae60f001483abce1489c0bef934874baca06541f0c0aa4384d7d7d83de9c6bb", size = 242856 },
-    { url = "https://files.pythonhosted.org/packages/85/91/678b0554d1c1da0bd6c5c00401f244fd4c11a84b507228a2df1476c7c070/tree_sitter_al-2.0.2-cp312-abi3-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:59b5e16dc0314171b8da90067a38d3ec20f28c65b7815ee8d12d8adec93f9358", size = 293640 },
-    { url = "https://files.pythonhosted.org/packages/b7/9f/620dce8b9868bd40e177b02c205aa082f6ba19868b9faa203da1c77f0039/tree_sitter_al-2.0.2-cp312-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:d9725be2a44f186863417596d3203939919df2ac2660a69f652c991c6822ac0d", size = 290036 },
-    { url = "https://files.pythonhosted.org/packages/46/8f/f921a5c8bf3ad059a6dcb553efbb511b09c19057855e2840bea9d98a36b3/tree_sitter_al-2.0.2-cp312-abi3-win32.whl", hash = "sha256:df95cb48785a448b09705380b03491b14ab5d8f355765ba860afb8e939bdd78c", size = 233618 },
-    { url = "https://files.pythonhosted.org/packages/21/03/ecd45eb4b94b9c120f73849273a2040f9387e5b87435308e77a2e9bbb2ec/tree_sitter_al-2.0.2-cp312-abi3-win_amd64.whl", hash = "sha256:81fde2b67fd2624a07e4ddaa52226452021b3ddad9b594dc0e89a498a0c5db29", size = 241179 },
+    { url = "https://files.pythonhosted.org/packages/55/ed/6e538c7bfc803040e317064ee44638bd7d238190c97661496365b7fa300d/tree_sitter_al-3.0.1-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:ef176ec67d89f3531e1c1667ee9ea84df25383dbfd96b429fc6eab61412c5441", size = 536933 },
+    { url = "https://files.pythonhosted.org/packages/18/2d/30ee314767ca6321257202119d5b9f41e116f78d42a9c2eb3237350aadc3/tree_sitter_al-3.0.1-cp312-abi3-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:f23c075e9261edb29c12537b8b23cf74797c680aa880019eb7d472bf4a85fd15", size = 550802 },
+    { url = "https://files.pythonhosted.org/packages/e4/be/4267f59a4aa4ccf7729804b63be11fa2b99369a992de7fc61b86b4cb3334/tree_sitter_al-3.0.1-cp312-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:e8c698382406d5cdee6fef75334efdac4e5af6eaff45678709b58f24462adb5e", size = 547458 },
+    { url = "https://files.pythonhosted.org/packages/4d/c9/83562c8ff561995dd47abdbb5b05abbf3a7419e61f3a817609531fbde5b7/tree_sitter_al-3.0.1-cp312-abi3-win32.whl", hash = "sha256:fc009179c91bd0231b7070d5ec636100b9a49490d3b6f65682d3d113bbe5cb28", size = 464615 },
+    { url = "https://files.pythonhosted.org/packages/02/ba/32a07be4f7bd57fd11859fa67089cbff814eaf7266a87f72d7c476ccdf07/tree_sitter_al-3.0.1-cp312-abi3-win_amd64.whl", hash = "sha256:f0baf67043267f67b433a98fbd15125a6c8f4949bc45f4e65fb38277b72cab4f", size = 464403 },
 ]
 
 [[package]]
